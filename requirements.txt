@@ -1,0 +1,14 @@
+# Requirements for Smart Factory Multi-Robot Coordination Simulation
+# Webots R2023b+ is required (not a pip package - install from https://cyberbotics.com)
+
+numpy>=1.21.0
+matplotlib>=3.5.0
+scipy>=1.7.0
+
+# Optional: For full PPO training with GPU support
+# torch>=1.12.0
+# gymnasium>=0.26.0
+
+# Optional: For advanced visualization
+# pandas>=1.4.0
+# seaborn>=0.12.0

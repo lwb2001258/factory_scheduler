@@ -1,0 +1,372 @@
+#VRML_SIM R2023b utf8
+# license: Apache 2.0
+# tags: robot, mobile, differential drive
+# documentation url: https://emanual.robotis.com/docs/en/platform/turtlebot3/overview/
+# TurtleBot3 Waffle mobile robot for Webots
+# Differential drive with 360-degree LiDAR and IMU
+# Adapted for smart factory multi-robot coordination simulation
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+
+PROTO TurtleBot3Waffle [
+  field SFVec3f    translation    0 0 0
+  field SFRotation rotation       0 0 1 0
+  field SFString   name           "turtlebot3_waffle"
+  field SFString   controller     "robot_controller"
+  field MFString   controllerArgs []
+  field SFString   customData     ""
+  field SFBool     supervisor     FALSE
+  field SFColor    bodyColor      0.2 0.2 0.2
+  field SFFloat    maxVelocity    26.0
+]
+{
+  Robot {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    controller IS controller
+    controllerArgs IS controllerArgs
+    customData IS customData
+    supervisor IS supervisor
+    children [
+      # ==================== BODY ====================
+      # Main chassis plate (lower)
+      Pose {
+        translation -0.064 0 0.033
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor IS bodyColor
+              roughness 0.8
+              metalness 0.3
+            }
+            geometry Box {
+              size 0.266 0.266 0.020
+            }
+          }
+        ]
+      }
+      # Main chassis plate (upper)
+      Pose {
+        translation -0.064 0 0.080
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor IS bodyColor
+              roughness 0.8
+              metalness 0.3
+            }
+            geometry Box {
+              size 0.266 0.266 0.010
+            }
+          }
+        ]
+      }
+      # Pillars connecting plates
+      Pose {
+        translation 0.04 0.1 0.055
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.5 0.5 0.5
+              roughness 0.6
+              metalness 0.5
+            }
+            geometry Cylinder {
+              height 0.04
+              radius 0.005
+            }
+          }
+        ]
+      }
+      Pose {
+        translation 0.04 -0.1 0.055
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.5 0.5 0.5
+              roughness 0.6
+              metalness 0.5
+            }
+            geometry Cylinder {
+              height 0.04
+              radius 0.005
+            }
+          }
+        ]
+      }
+      Pose {
+        translation -0.168 0.1 0.055
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.5 0.5 0.5
+              roughness 0.6
+              metalness 0.5
+            }
+            geometry Cylinder {
+              height 0.04
+              radius 0.005
+            }
+          }
+        ]
+      }
+      Pose {
+        translation -0.168 -0.1 0.055
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.5 0.5 0.5
+              roughness 0.6
+              metalness 0.5
+            }
+            geometry Cylinder {
+              height 0.04
+              radius 0.005
+            }
+          }
+        ]
+      }
+
+      # ==================== LiDAR ====================
+      Pose {
+        translation -0.064 0 0.102
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.0 0.0 0.0
+              roughness 0.4
+              metalness 0.1
+            }
+            geometry Cylinder {
+              height 0.030
+              radius 0.028
+            }
+          }
+        ]
+      }
+      # LiDAR sensor
+      Lidar {
+        translation -0.064 0 0.120
+        rotation 0 0 1 0
+        name "lidar"
+        horizontalResolution 360
+        fieldOfView 6.2832
+        numberOfLayers 1
+        maxRange 3.5
+        minRange 0.12
+        type "rotating"
+        noise 0.005
+      }
+
+      # ==================== CAMERA ====================
+      Camera {
+        translation 0.073 -0.011 0.084
+        rotation 0 0 1 0
+        name "camera"
+        fieldOfView 1.085
+        width 640
+        height 480
+        near 0.01
+        far 10.0
+      }
+
+      # ==================== IMU ====================
+      InertialUnit {
+        translation 0 0 0.068
+        name "imu"
+        noise 0.001
+      }
+      Accelerometer {
+        translation 0 0 0.068
+        name "accelerometer"
+        xAxis TRUE
+        yAxis TRUE
+        zAxis TRUE
+      }
+      Gyro {
+        translation 0 0 0.068
+        name "gyro"
+        xAxis TRUE
+        yAxis TRUE
+        zAxis TRUE
+      }
+
+      # ==================== GPS (for position tracking) ====================
+      GPS {
+        translation 0 0 0.068
+        name "gps"
+        accuracy 0.01
+      }
+
+      # ==================== COMPASS ====================
+      Compass {
+        translation 0 0 0.068
+        name "compass"
+      }
+
+      # ==================== DISTANCE SENSORS ====================
+      DistanceSensor {
+        translation 0.069 0.047 0.05
+        rotation 0 0 1 0.35
+        name "ds_front_left"
+        lookupTable [0 0 0.0, 0.5 500 0.005, 2.0 2000 0.01]
+        type "infra-red"
+      }
+      DistanceSensor {
+        translation 0.069 -0.047 0.05
+        rotation 0 0 1 -0.35
+        name "ds_front_right"
+        lookupTable [0 0 0.0, 0.5 500 0.005, 2.0 2000 0.01]
+        type "infra-red"
+      }
+
+      # ==================== LEFT WHEEL ====================
+      HingeJoint {
+        jointParameters HingeJointParameters {
+          axis 0 1 0
+          anchor 0 0.144 0.010
+        }
+        device [
+          RotationalMotor {
+            name "left_wheel_motor"
+            maxVelocity IS maxVelocity
+            maxTorque 1.8
+          }
+          PositionSensor {
+            name "left_wheel_sensor"
+            resolution 0.001
+          }
+        ]
+        endPoint Solid {
+          translation 0 0.144 0.010
+          rotation 1 0 0 1.5708
+          children [
+            Shape {
+              appearance PBRAppearance {
+                baseColor 0.1 0.1 0.1
+                roughness 1.0
+                metalness 0.0
+              }
+              geometry Cylinder {
+                height 0.018
+                radius 0.033
+              }
+            }
+          ]
+          name "left_wheel"
+          boundingObject Cylinder {
+            height 0.018
+            radius 0.033
+          }
+          physics Physics {
+            density -1
+            mass 0.1
+          }
+        }
+      }
+
+      # ==================== RIGHT WHEEL ====================
+      HingeJoint {
+        jointParameters HingeJointParameters {
+          axis 0 1 0
+          anchor 0 -0.144 0.010
+        }
+        device [
+          RotationalMotor {
+            name "right_wheel_motor"
+            maxVelocity IS maxVelocity
+            maxTorque 1.8
+          }
+          PositionSensor {
+            name "right_wheel_sensor"
+            resolution 0.001
+          }
+        ]
+        endPoint Solid {
+          translation 0 -0.144 0.010
+          rotation 1 0 0 1.5708
+          children [
+            Shape {
+              appearance PBRAppearance {
+                baseColor 0.1 0.1 0.1
+                roughness 1.0
+                metalness 0.0
+              }
+              geometry Cylinder {
+                height 0.018
+                radius 0.033
+              }
+            }
+          ]
+          name "right_wheel"
+          boundingObject Cylinder {
+            height 0.018
+            radius 0.033
+          }
+          physics Physics {
+            density -1
+            mass 0.1
+          }
+        }
+      }
+
+      # ==================== CASTER WHEEL ====================
+      Solid {
+        translation -0.177 0 -0.023
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.3 0.3 0.3
+              roughness 1.0
+              metalness 0.0
+            }
+            geometry Sphere {
+              radius 0.005
+            }
+          }
+        ]
+        name "caster_wheel"
+        boundingObject Sphere {
+          radius 0.005
+        }
+        physics Physics {
+          density -1
+          mass 0.01
+        }
+      }
+
+      # ==================== EMITTER/RECEIVER for communication ====================
+      Emitter {
+        name "emitter"
+        channel 1
+        range 100
+      }
+      Receiver {
+        name "receiver"
+        channel 1
+      }
+
+      # ==================== LED indicators ====================
+      LED {
+        translation 0.07 0.04 0.09
+        name "led_status"
+        color 0 1 0
+      }
+    ]
+    boundingObject Pose {
+      translation -0.064 0 0.048
+      children [
+        Box {
+          size 0.266 0.266 0.094
+        }
+      ]
+    }
+    physics Physics {
+      density -1
+      mass 1.8
+      centerOfMass [-0.064 0 0.048]
+    }
+  }
+}

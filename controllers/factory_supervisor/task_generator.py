@@ -125,6 +125,7 @@ class TaskGenerator:
         if current_time >= self.next_arrival_time:
             # Generate new task
             pickup_loc, delivery_loc = self._generate_task_pair()
+            priority_roll = self.rng.random()
             
             self.task_counter += 1
             task = TransportTask(
@@ -134,7 +135,8 @@ class TaskGenerator:
                 pickup_position=ALL_LOCATIONS[pickup_loc],
                 delivery_position=ALL_LOCATIONS[delivery_loc],
                 arrival_time=current_time,
-                priority=1.0 + self.rng.random() * 0.5  # slight priority variation
+                priority=(3 if priority_roll < 0.05 else
+                          2 if priority_roll < 0.25 else 1)
             )
             
             self.tasks_generated.append(task)

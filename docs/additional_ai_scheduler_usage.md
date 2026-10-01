@@ -59,3 +59,6 @@ python scripts/run_experiments.py --standalone `
 Standalone 只用于算法回归，不能形成上线结论。上线前必须换用未见 seed 在真实 Webots 控制循环中与 Hungarian 配对运行，再用 `evaluate_scheduler_results.py` 检查吞吐、平均/P95 完成时间、安全事件、距离违规、非法输出、fallback 和调度 P95 延迟。
 
 任何模型缺失、损坏、版本/维度不兼容、产生 NaN/Inf、返回非法动作/匹配或推理超时，调度器工厂都会保留或切换到 Hungarian。
+
+两套训练目标以及 3/5/8 机器人统一评估方案见
+[`dual_training_evaluation_design.md`](dual_training_evaluation_design.md)。

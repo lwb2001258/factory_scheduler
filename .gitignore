@@ -24,6 +24,8 @@
 !/docs/additional_ai_scheduler_usage.md
 !/docs/webots_logic_training_workflow.md
 !/docs/webots_logic_training_review_log.md
+!/docs/dual_training_evaluation_design.md
+!/docs/dual_training_evaluation_review_log.md
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -30,6 +30,8 @@ class TransportTask:
     pickup_time: Optional[float] = None
     completion_time: Optional[float] = None
     priority: float = 1.0         # Higher = more urgent
+    learning_trace: Optional[dict] = field(
+        default=None, repr=False, compare=False)
 
     @property
     def waiting_time(self) -> Optional[float]:

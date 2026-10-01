@@ -71,6 +71,7 @@ from schedulers import (
     NearestNeighbourScheduler,
     Assignment, SchedulingContext, SchedulerResult,
 )
+from learning_scheduler import attach_learning_trace
 from startup_gate import StartupGate
 from metrics_collector import MetricsCollector, SafetyEvent
 from joint_plan_transaction import JointPlanTransaction
@@ -159,6 +160,8 @@ class RobotInfo:
             'battery': self.battery,
             'current_task': self.current_task,
             'has_task': self.current_task is not None,
+            'tasks_completed': self.tasks_completed,
+            'total_distance': self.total_distance,
             'goal_location': self._get_current_goal(),
             'wait_age': max(0.0, self.sample_time - self.wait_started)
                         if self.wait_started else 0.0,
@@ -420,12 +423,19 @@ class FactorySupervisor:
         plans = {}
         offsets = {}
         partial = {}
-        fallback_log = getattr(self, '_fallback_debug_path', None)
-        if fallback_log is None:
-            fallback_log = r'D:\code\smart_factory_scheduler\results\fallback_debug.log'
-            self._fallback_debug_path = fallback_log
-            with open(fallback_log, 'w', encoding='utf-8') as handle:
-                handle.write('call,rid,event\n')
+        if not hasattr(self, '_fallback_debug_path'):
+            fallback_log = os.path.join(
+                self.metrics.output_dir, 'fallback_debug.log')
+            try:
+                with open(fallback_log, 'w', encoding='utf-8') as handle:
+                    handle.write('call,rid,event\n')
+                self._fallback_debug_path = fallback_log
+            except OSError as exc:
+                # A diagnostic file must never terminate the physical run.
+                self._fallback_debug_path = ''
+                print(f"[JointFallback] Debug log disabled: {exc}",
+                      file=sys.stderr)
+        fallback_log = self._fallback_debug_path
         debug_lines = [f'{self.sim_time:.3f},all,start']
         for rid in sorted(planning_agents,
                            key=self._priority_yield_key,
@@ -461,8 +471,14 @@ class FactorySupervisor:
             plans[rid] = points
             offsets[rid] = [0.0] * len(points)
             partial[rid] = not is_full_goal
-        with open(fallback_log, 'a', encoding='utf-8') as handle:
-            handle.write('\n'.join(debug_lines) + '\n')
+        if fallback_log:
+            try:
+                with open(fallback_log, 'a', encoding='utf-8') as handle:
+                    handle.write('\n'.join(debug_lines) + '\n')
+            except OSError as exc:
+                self._fallback_debug_path = ''
+                print(f"[JointFallback] Debug log disabled: {exc}",
+                      file=sys.stderr)
         return plans, offsets, partial
 
     def _retire_joint_transaction(self, txn, reason: str = 'rolling_replan'):
@@ -891,7 +907,8 @@ class FactorySupervisor:
                 'SMART_FACTORY_DEBUG_SHIELD', '0') == '1'
             self._shield_debug_path = os.environ.get(
                 'SMART_FACTORY_DEBUG_SHIELD_PATH',
-                r'D:\code\smart_factory_scheduler\results\joint_shield_debug.log')
+                os.path.join(
+                    self.metrics.output_dir, 'joint_shield_debug.log'))
             if self._shield_debug_enabled:
                 with open(self._shield_debug_path, 'w', encoding='utf-8') as handle:
                     handle.write('sim_time,trajectories,conflicts,components,actions\n')
@@ -2314,7 +2331,9 @@ class FactorySupervisor:
         self.metrics = MetricsCollector(
             scenario_name=scenario,
             scheduler_name=self.scheduler.name,
-            num_robots=self.num_robots
+            num_robots=self.num_robots,
+            seed=seed,
+            runtime_mode="webots",
         )
         
         # Robot tracking
@@ -2335,7 +2354,7 @@ class FactorySupervisor:
         self.running = True
         self._debug_state_path = os.environ.get(
             'SMART_FACTORY_DEBUG_STATES',
-            r'D:\code\smart_factory_scheduler\results\debug_states.log')
+            os.path.join(self.metrics.output_dir, 'debug_states.log'))
         self._debug_state_enabled = (
             os.environ.get('SMART_FACTORY_DEBUG_STATES_ENABLED', '0') == '1')
         self._debug_state_interval = max(
@@ -6194,6 +6213,9 @@ class FactorySupervisor:
                           f"{task.task_id}/robot {robot_id}: command send failed")
                     continue
                 active_scheduler.on_assignment_committed(assignment)
+                attach_learning_trace(
+                    task, assignment, robot_states, pending, context,
+                    decision.algorithm_name or active_scheduler.name)
                 self.metrics.record_scheduler_commit(
                     decision.algorithm_name or active_scheduler.name,
                     native=(active_scheduler is self.scheduler and

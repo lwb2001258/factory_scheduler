@@ -10,7 +10,7 @@ Implements:
 6. Centralized epsilon-Auction
 7. Time-bounded Genetic Algorithm
 8. Time-bounded Simulated Annealing
-9. PPO, DQN and SARSA RL schedulers - require validated checkpoints
+9. PPO, DQN, SARSA and advanced AI schedulers - require validated checkpoints
 
 All schedulers implement the same interface for fair comparison.
 """
@@ -35,7 +35,7 @@ from config import (
 
 
 class ModelValidationError(RuntimeError):
-    """Raised when an RL checkpoint is absent or incompatible."""
+    """Raised when a learned scheduler checkpoint is absent or incompatible."""
 
 
 @dataclass(frozen=True)
@@ -1613,8 +1613,9 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
     Args:
         scheduler_type: One of "FCFS", "NearestNeighbour", "RoundRobin",
             "Greedy", "Random", "Hungarian", "Auction", "GA", "SA",
-            "PPO_RL", "DQN", "SARSA"
-        model_path: Path to a validated checkpoint for an RL scheduler.
+            "LearnedHungarian", "GraphImitation", "GraphPPO", "RainbowDQN",
+            "QRDQN", "CQL", "LinUCB", "PPO_RL", "DQN", "SARSA"
+        model_path: Path to a validated checkpoint for a learned scheduler.
         
     Returns:
         Scheduler instance.
@@ -1640,6 +1641,23 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
             max_iterations=int(os.environ.get("SA_MAX_ITERATIONS", "2000")),
             time_budget_ms=float(os.environ.get("SA_TIME_BUDGET_MS", "5"))),
     }
+
+    if scheduler_type in {"LearnedHungarian", "GraphImitation"}:
+        try:
+            from learning_scheduler import (
+                GraphImitationScheduler, LearnedCostHungarianScheduler)
+            if scheduler_type == "LearnedHungarian":
+                return LearnedCostHungarianScheduler(model_path)
+            return GraphImitationScheduler(model_path)
+        except ModelValidationError as exc:
+            if not allow_safe_fallback:
+                raise
+            fallback = HungarianScheduler()
+            fallback.name = f"{scheduler_type}_FALLBACK_HUNGARIAN"
+            fallback.fallback_reason = str(exc)
+            print(f"[Scheduler] {scheduler_type} unavailable; "
+                  f"using Hungarian: {exc}")
+            return fallback
     
     if scheduler_type in {"DQN", "SARSA"}:
         try:
@@ -1649,6 +1667,48 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
                 DQNScheduler(model_path, seed=seed)
                 if scheduler_type == "DQN"
                 else SarsaScheduler(model_path, seed=seed))
+            return RLSchedulerSafetyWrapper(scheduler)
+        except ModelValidationError as exc:
+            if not allow_safe_fallback:
+                raise
+            fallback = HungarianScheduler()
+            fallback.name = f"{scheduler_type}_FALLBACK_HUNGARIAN"
+            fallback.fallback_reason = str(exc)
+            print(f"[Scheduler] {scheduler_type} unavailable; "
+                  f"using Hungarian: {exc}")
+            return fallback
+
+    if scheduler_type in {"RainbowDQN", "QRDQN", "CQL"}:
+        try:
+            from advanced_rl_schedulers import (
+                CQLScheduler, QRDQNScheduler, RainbowDQNScheduler)
+            from rl_schedulers import RLSchedulerSafetyWrapper
+            scheduler_class = {
+                "RainbowDQN": RainbowDQNScheduler,
+                "QRDQN": QRDQNScheduler,
+                "CQL": CQLScheduler,
+            }[scheduler_type]
+            return RLSchedulerSafetyWrapper(
+                scheduler_class(model_path, seed=seed))
+        except ModelValidationError as exc:
+            if not allow_safe_fallback:
+                raise
+            fallback = HungarianScheduler()
+            fallback.name = f"{scheduler_type}_FALLBACK_HUNGARIAN"
+            fallback.fallback_reason = str(exc)
+            print(f"[Scheduler] {scheduler_type} unavailable; "
+                  f"using Hungarian: {exc}")
+            return fallback
+
+    if scheduler_type in {"GraphPPO", "LinUCB"}:
+        try:
+            from rl_schedulers import RLSchedulerSafetyWrapper
+            if scheduler_type == "GraphPPO":
+                from graph_ppo_scheduler import GraphPPOScheduler
+                scheduler = GraphPPOScheduler(model_path, seed=seed)
+            else:
+                from bandit_scheduler import LinUCBScheduler
+                scheduler = LinUCBScheduler(model_path)
             return RLSchedulerSafetyWrapper(scheduler)
         except ModelValidationError as exc:
             if not allow_safe_fallback:
@@ -1690,4 +1750,4 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
         return schedulers[scheduler_type]()
     
     raise ValueError(f"Unknown scheduler type: {scheduler_type}. "
-                     f"Available: {list(schedulers.keys()) + ['PPO_RL', 'DQN', 'SARSA']}")
+                     f"Available: {list(schedulers.keys()) + ['LearnedHungarian', 'GraphImitation', 'GraphPPO', 'RainbowDQN', 'QRDQN', 'CQL', 'LinUCB', 'PPO_RL', 'DQN', 'SARSA']}")

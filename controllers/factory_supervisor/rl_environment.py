@@ -196,6 +196,33 @@ class SchedulingEnvironment:
             return None
         return Assignment(rid, task, cost)
 
+    def action_for_pair(self, robot_id: int, task_id: int) -> int:
+        """Map canonical graph-policy IDs back to the fixed action space."""
+        self._refresh_slots()
+        try:
+            robot_slot = self._robot_slots.index(int(robot_id))
+            task_slot = next(
+                index for index, task in enumerate(self._task_slots)
+                if task.task_id == int(task_id))
+        except (ValueError, StopIteration) as exc:
+            raise ValueError("robot-task pair is not in the current slots") from exc
+        action = self.encode_action(robot_slot, task_slot)
+        if not self.get_action_mask()[action]:
+            raise ValueError("robot-task pair is not a legal action")
+        return action
+
+    def policy_snapshot(self):
+        """Return read-only-by-contract inputs for graph policy encoding.
+
+        Callers must not mutate these objects.  Keeping the live references is
+        necessary because a bound path-cost provider observes the same robot
+        state objects as the abstract environment.  Only arrived task slots
+        are exposed so graph edges have exactly the same semantics as the
+        fixed action mask.
+        """
+        self._refresh_slots()
+        return self._robots, tuple(self._task_slots), self._context
+
     def observe(self) -> np.ndarray:
         self._refresh_slots()
         self._cost_matrix = None

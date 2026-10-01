@@ -56,10 +56,14 @@ class MetricsCollector:
     Collects and manages all performance metrics during simulation.
     """
     
-    def __init__(self, scenario_name: str, scheduler_name: str, num_robots: int):
+    def __init__(self, scenario_name: str, scheduler_name: str, num_robots: int,
+                 seed: Optional[int] = None,
+                 runtime_mode: str = "unknown"):
         self.scenario_name = scenario_name
         self.scheduler_name = scheduler_name
         self.num_robots = num_robots
+        self.seed = int(seed) if seed is not None else None
+        self.runtime_mode = str(runtime_mode)
         
         # Time-series data
         self.step_records: List[StepRecord] = []
@@ -123,16 +127,20 @@ class MetricsCollector:
         self.rl_fallback_decisions = 0
         
         # Output path
-        self.output_dir = os.path.join(
+        default_output_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
             "results"
         )
+        self.output_dir = os.path.abspath(os.environ.get(
+            "SMART_FACTORY_RESULTS_DIR", default_output_dir))
         os.makedirs(self.output_dir, exist_ok=True)
         
         timestamp = time.strftime("%Y%m%d_%H%M%S")
+        seed_suffix = f"_seed{self.seed}" if self.seed is not None else ""
         self.output_path = os.path.join(
             self.output_dir,
-            f"experiment_{scenario_name}_{scheduler_name}_{timestamp}.json"
+            f"experiment_{scenario_name}_{scheduler_name}{seed_suffix}_"
+            f"{timestamp}.json"
         )
 
     def record_scheduling_latency(self, seconds: float):
@@ -481,6 +489,9 @@ class MetricsCollector:
             'execution_time': task.execution_time,
             'pickup': task.pickup_location,
             'delivery': task.delivery_location,
+            'priority': task.priority,
+            'learning_trace': (dict(task.learning_trace)
+                               if task.learning_trace else None),
         })
     
     def record_conflict_scan(self, conflicts, sim_time: float) -> None:
@@ -734,6 +745,8 @@ class MetricsCollector:
                 "scenario": self.scenario_name,
                 "scheduler": self.scheduler_name,
                 "num_robots": self.num_robots,
+                "seed": self.seed,
+                "runtime_mode": self.runtime_mode,
                 "sim_duration": total_time,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             },

@@ -15,6 +15,7 @@ from learning_scheduler import (
     solve_hungarian,
 )
 from rl_environment import RLEnvironmentConfig, SchedulingEnvironment
+from headless_training_runtime import summarize_runtime_telemetry
 from schedulers import (
     BaseScheduler, CostMatrix, ModelValidationError, SchedulerResult,
     SchedulingContext, _result_from_matching, build_cost_matrix,
@@ -373,7 +374,7 @@ def train_graph_ppo(model: GraphPPOModel, episode_seeds: Iterable[int], *,
                     max_steps: Optional[int] = None) -> dict:
     seeds = _strict_seeds(episode_seeds)
     environment = SchedulingEnvironment(
-        env_config, simulation_mode="abstract")
+        env_config, simulation_mode="headless")
     step_limit = (environment.config.max_steps_per_episode
                   if max_steps is None else int(max_steps))
     if step_limit <= 0:
@@ -381,6 +382,7 @@ def train_graph_ppo(model: GraphPPOModel, episode_seeds: Iterable[int], *,
     losses = []
     returns = []
     decision_count = 0
+    runtime_rows = []
     for seed in seeds:
         robots, tasks, context = factory_scenario(seed)
         environment.reset(robots, tasks, context, seed=seed)
@@ -424,6 +426,7 @@ def train_graph_ppo(model: GraphPPOModel, episode_seeds: Iterable[int], *,
         if report["mean_loss"] is not None:
             losses.append(report["mean_loss"])
         returns.append(episode_return)
+        runtime_rows.append(environment.runtime_telemetry())
     if (not np.all(np.isfinite(returns)) or
             (losses and not np.all(np.isfinite(losses)))):
         raise ValueError("GraphPPO training produced non-finite metrics")
@@ -434,4 +437,5 @@ def train_graph_ppo(model: GraphPPOModel, episode_seeds: Iterable[int], *,
         "updates": model.training_step,
         "mean_return": float(np.mean(returns)),
         "mean_loss": float(np.mean(losses)) if losses else None,
+        "runtime": summarize_runtime_telemetry(runtime_rows),
     }

@@ -24,16 +24,24 @@ from advanced_rl_agents import (  # noqa: E402
 from advanced_rl_training import (  # noqa: E402
     collect_cql_dataset, train_online_value_agent,
 )
+from ai_training_integration import (  # noqa: E402
+    AI_ALGORITHM_NAMES, capability_report, run_scheduler_episode,
+)
 from bandit_scheduler import LinUCBModel, LinUCBScheduler, train_linucb  # noqa: E402
 from graph_ppo_scheduler import (  # noqa: E402
     GraphPPOConfig, GraphPPOModel, GraphPPOScheduler, train_graph_ppo,
 )
+from headless_training_runtime import (  # noqa: E402
+    HEADLESS_DYNAMICS_VERSION, summarize_runtime_telemetry,
+)
 from rl_environment import SchedulingEnvironment  # noqa: E402
-from schedulers import HungarianScheduler, validate_assignments  # noqa: E402
+from schedulers import (  # noqa: E402
+    HungarianScheduler, create_scheduler, validate_assignments,
+)
 from training_scenarios import factory_scenario  # noqa: E402
 
 
-WORKFLOW_VERSION = "advanced-ai-scheduler-workflow-v1"
+WORKFLOW_VERSION = "advanced-ai-scheduler-workflow-v2-headless"
 
 
 def _strict_seeds(values, name):
@@ -58,11 +66,12 @@ def _write_json_atomic(path: Path, value: dict) -> None:
 
 
 def evaluate_value_agent(agent, seeds, max_steps: int) -> dict:
-    environment = SchedulingEnvironment(simulation_mode="abstract")
+    environment = SchedulingEnvironment(simulation_mode="headless")
     returns = []
     latencies = []
     invalid_actions = 0
     decisions = 0
+    runtime_rows = []
     for seed in seeds:
         robots, tasks, context = factory_scenario(seed)
         state, _ = environment.reset(robots, tasks, context, seed=seed)
@@ -89,6 +98,7 @@ def evaluate_value_agent(agent, seeds, max_steps: int) -> dict:
             if terminated or truncated or step+1 >= max_steps:
                 break
         returns.append(episode_return)
+        runtime_rows.append(environment.runtime_telemetry())
     return {
         "episodes": len(returns),
         "decisions": decisions,
@@ -96,6 +106,7 @@ def evaluate_value_agent(agent, seeds, max_steps: int) -> dict:
         "mean_return": float(np.mean(returns)),
         "decision_p95_ms": float(np.percentile(latencies, 95))
         if latencies else None,
+        "runtime": summarize_runtime_telemetry(runtime_rows),
     }
 
 
@@ -148,7 +159,7 @@ def run_workflow(*, output_dir: Path, train_seeds, validation_seeds,
     candidate_dir = output_dir/"candidates"
     candidate_dir.mkdir(parents=True, exist_ok=True)
 
-    environment = SchedulingEnvironment(simulation_mode="abstract")
+    environment = SchedulingEnvironment(simulation_mode="headless")
     expected_rows = len(train_seeds)*max_steps
     batch_size = max(2, min(32, max(2, expected_rows//2)))
     capacity = max(128, expected_rows*3)
@@ -247,6 +258,19 @@ def run_workflow(*, output_dir: Path, train_seeds, validation_seeds,
         GraphPPOScheduler(paths["GraphPPO"]), validation_seeds)
     linucb_validation = evaluate_matching_scheduler(
         LinUCBScheduler(paths["LinUCB"]), validation_seeds)
+    generated_names = (
+        "GraphPPO", "RainbowDQN", "QRDQN", "CQL", "LinUCB")
+    runtime_validation = {}
+    for index, name in enumerate(generated_names):
+        scheduler = create_scheduler(
+            name, str(paths[name]), seed=train_seeds[0] + 100 + index,
+            allow_safe_fallback=False)
+        if hasattr(scheduler, "timeout_seconds"):
+            scheduler.timeout_seconds = 10.0
+        runtime_validation[name] = run_scheduler_episode(
+            scheduler, validation_seeds[0],
+            max_decisions=max(2, min(max_steps, 8)))
+    capabilities = capability_report()
     gates = {
         "disjoint_train_validation_seeds": not bool(
             set(train_seeds) & set(validation_seeds)),
@@ -264,6 +288,15 @@ def run_workflow(*, output_dir: Path, train_seeds, validation_seeds,
             rainbow.training_step > 0 and qrdqn.training_step > 0 and
             cql.training_step > 0 and graph_ppo.training_step > 0 and
             linucb.training_samples > 0),
+        "all_ai_algorithms_registered_for_headless_execution": (
+            tuple(capabilities) == AI_ALGORITHM_NAMES and
+            all(item["headless_execution"]
+                for item in capabilities.values())),
+        "generated_schedulers_execute_in_headless_runtime": all(
+            metrics["rejected_outputs"] == 0 and
+            metrics["runtime"]["assignments_committed"] > 0 and
+            metrics["runtime"]["runtime_mode"] == "headless_webots_logic"
+            for metrics in runtime_validation.values()),
     }
     research_ready = all(gates.values())
     report = {
@@ -280,6 +313,13 @@ def run_workflow(*, output_dir: Path, train_seeds, validation_seeds,
             "validation_seeds": list(validation_seeds),
             "max_steps_per_episode": max_steps,
             "offline_cql_updates": offline_updates,
+            "runtime_mode": "headless_webots_logic",
+            "dynamics_version": HEADLESS_DYNAMICS_VERSION,
+            "physics_fidelity": "business_logic_only",
+            "not_simulated": [
+                "webots_physics", "distance_sensors", "local_dwa",
+                "radio_delivery_failures", "physical_collision_contact",
+            ],
         },
         "training": {
             "RainbowDQN": rainbow_training,
@@ -288,10 +328,12 @@ def run_workflow(*, output_dir: Path, train_seeds, validation_seeds,
             "GraphPPO": graph_training,
             "LinUCB": linucb_training,
         },
+        "ai_training_capabilities": capabilities,
         "validation": {
             "value_agents": value_validation,
             "GraphPPO": graph_validation,
             "LinUCB": linucb_validation,
+            "headless_scheduler_execution": runtime_validation,
         },
         "gates": gates,
         "artifacts": {name: str(path) for name, path in paths.items()},
@@ -309,7 +351,9 @@ def run_workflow(*, output_dir: Path, train_seeds, validation_seeds,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Train additional AI task schedulers in the abstract model")
+        description=(
+            "Train additional AI task schedulers in the headless "
+            "Webots-business-logic runtime"))
     parser.add_argument(
         "--output-dir", type=Path,
         default=ROOT/"results"/"advanced_ai_scheduler")

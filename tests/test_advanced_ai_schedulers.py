@@ -658,6 +658,10 @@ class AdvancedWorkflowIntegrationTests(unittest.TestCase):
             document = json.loads(
                 (output/"workflow_report.json").read_text(encoding="utf-8"))
             self.assertEqual(document["status"], "research_candidates_ready")
+            self.assertEqual(len(document["ai_training_capabilities"]), 10)
+            self.assertTrue(all(
+                item["headless_execution"]
+                for item in document["ai_training_capabilities"].values()))
             self.assertFalse(set(document["data"]["training_seeds"]) &
                              set(document["data"]["validation_seeds"]))
             for path in document["artifacts"].values():
@@ -675,6 +679,16 @@ class AdvancedWorkflowIntegrationTests(unittest.TestCase):
                     name, path, allow_safe_fallback=False)
                 result = scheduler.assign(visible, robots, context)
                 self.assertTrue(result.is_feasible, name)
+            runtime_validation = document["validation"][
+                "headless_scheduler_execution"]
+            self.assertEqual(set(runtime_validation), set(artifact_by_scheduler))
+            for name, metrics in runtime_validation.items():
+                self.assertEqual(metrics["rejected_outputs"], 0, name)
+                self.assertGreater(
+                    metrics["runtime"]["assignments_committed"], 0, name)
+                self.assertEqual(
+                    metrics["runtime"]["runtime_mode"],
+                    "headless_webots_logic")
 
 
 if __name__ == "__main__":

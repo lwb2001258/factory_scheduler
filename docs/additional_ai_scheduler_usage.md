@@ -32,7 +32,15 @@ python scripts/run_advanced_ai_workflow.py `
   --fail-on-gate
 ```
 
-输出包括 `candidates/*.npz` 和 `workflow_report.json`。通过该 workflow 只表示 checkpoint、合法性、可复现性和抽象环境门禁通过，**不会自动生产晋级**。
+输出包括 `candidates/*.npz` 和 `workflow_report.json`。通过该 workflow 只表示 checkpoint、合法性、可复现性和 headless Webots 业务逻辑门禁通过，**不会自动生产晋级**。
+
+## 与 Webots 的一致范围
+
+训练环境现在按 16 ms 步长推进，并复用项目的 `MotionCoordinator`，执行与 Supervisor 相同的任务提交、取货、送货、低电量门禁、到站五秒换电、失败配对暂时屏蔽、路径预约和死锁监测语义。报告固定标记为 `headless_webots_logic` / `business_logic_only`。
+
+它不包含 Webots 物理引擎、轮速动力学、距离传感器、机器人本地 DWA、无线通信失败和真实碰撞接触。因此 headless 训练适合预训练和回归，训练后的模型仍须在未见 seed 的 Webots 运行中微调或做配对验收。
+
+项目中的 10 个 AI 调度器都可通过统一的 `step_scheduler` 接入该运行时：`LearnedHungarian`、`GraphImitation`、`PPO_RL`、`SARSA`、`DQN`、`GraphPPO`、`RainbowDQN`、`QRDQN`、`CQL`、`LinUCB`。它们共享执行环境，但学习方法并不相同：前两者使用监督/模仿数据，`CQL` 使用环境采集的离线数据，`LinUCB` 使用 bandit 反馈，其余算法使用在线运行时 transition/reward。`workflow_report.json` 的 `ai_training_capabilities` 会记录每种算法的实际训练入口。
 
 ## Standalone 配对实验
 

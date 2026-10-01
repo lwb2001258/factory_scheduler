@@ -1,7 +1,8 @@
-"""Deterministic abstract-environment training primitives.
+"""Deterministic headless Webots-logic training primitives.
 
 These functions use the same versioned scheduling environment as deployment.
-They never invoke Webots control, navigation or collision-avoidance code.
+They use the unchanged project path coordinator, but never invoke Webots
+physics, sensors, radio, or robot-controller collision avoidance.
 """
 
 import math
@@ -10,6 +11,7 @@ from typing import Iterable, Optional
 import numpy as np
 
 from advanced_rl_agents import OfflineTransitionDataset
+from headless_training_runtime import summarize_runtime_telemetry
 from rl_environment import RLEnvironmentConfig, SchedulingEnvironment
 from training_scenarios import factory_scenario
 
@@ -26,7 +28,7 @@ def _normalise_seeds(values: Iterable[int]) -> tuple:
 
 def _environment_for_agent(agent, env_config=None):
     environment = SchedulingEnvironment(
-        env_config, simulation_mode="abstract")
+        env_config, simulation_mode="headless")
     if (agent.state_dim != environment.observation_dim or
             agent.action_dim != environment.action_dim or
             agent.no_op_action != environment.no_op_action):
@@ -47,6 +49,7 @@ def train_online_value_agent(agent, episode_seeds: Iterable[int], *,
     losses = []
     returns = []
     steps = 0
+    runtime_rows = []
     for seed in seeds:
         robots, tasks, context = factory_scenario(seed)
         state, _ = environment.reset(robots, tasks, context, seed=seed)
@@ -69,6 +72,7 @@ def train_online_value_agent(agent, episode_seeds: Iterable[int], *,
             if done:
                 break
         returns.append(episode_return)
+        runtime_rows.append(environment.runtime_telemetry())
     if (not np.all(np.isfinite(returns)) or
             (losses and not np.all(np.isfinite(losses)))):
         raise ValueError("training produced non-finite metrics")
@@ -79,6 +83,7 @@ def train_online_value_agent(agent, episode_seeds: Iterable[int], *,
         "updates": len(losses),
         "mean_return": float(np.mean(returns)),
         "mean_loss": float(np.mean(losses)) if losses else None,
+        "runtime": summarize_runtime_telemetry(runtime_rows),
     }
 
 
@@ -109,7 +114,7 @@ def collect_cql_dataset(episode_seeds: Iterable[int], *,
     """Collect a fixed, explicitly labelled cost-greedy behaviour data set."""
     seeds = _normalise_seeds(episode_seeds)
     environment = SchedulingEnvironment(
-        env_config, simulation_mode="abstract")
+        env_config, simulation_mode="headless")
     step_limit = (environment.config.max_steps_per_episode
                   if max_steps is None else int(max_steps))
     if step_limit <= 0:

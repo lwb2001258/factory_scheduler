@@ -4,6 +4,7 @@
 !/tests/test_learning_scheduler.py
 !/tests/test_webots_launcher.py
 !/tests/test_advanced_ai_schedulers.py
+!/tests/test_headless_training_runtime.py
 /scripts/
 !/scripts/
 /scripts/*
@@ -21,6 +22,8 @@
 !/docs/additional_ai_scheduler_workflow.md
 !/docs/additional_ai_scheduler_review_log.md
 !/docs/additional_ai_scheduler_usage.md
+!/docs/webots_logic_training_workflow.md
+!/docs/webots_logic_training_review_log.md
 __pycache__/
 *.py[cod]
 .pytest_cache/

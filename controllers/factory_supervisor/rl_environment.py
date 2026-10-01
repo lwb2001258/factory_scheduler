@@ -1,24 +1,24 @@
-"""Versioned, Webots-independent environment contract for RL schedulers."""
+"""Versioned observation contract and headless Webots-logic trainer."""
 
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from config import (BATTERY_CAPACITY, BATTERY_DRAIN_RATE, CHARGING_STATIONS,
-                    FULL_BATTERY_THRESHOLD, MAX_ROBOTS, MIN_TASK_BATTERY,
-                    RL_ENVIRONMENT_VERSION, RobotState, TaskStatus)
+from config import (BATTERY_CAPACITY, MAX_ROBOTS, RL_ENVIRONMENT_VERSION,
+                    RobotState, TaskStatus)
+from headless_training_runtime import (
+    HEADLESS_DYNAMICS_VERSION, HeadlessFactoryRuntime, HeadlessRuntimeConfig,
+)
 from schedulers import (
     Assignment, SchedulingContext, build_cost_matrix, validate_assignment,
+    validate_assignments,
 )
 from task_generator import TransportTask
 
 
 ENVIRONMENT_VERSION = RL_ENVIRONMENT_VERSION
-ABSTRACT_LINEAR_SPEED = 0.22  # robot_controller's executable speed limit
-
-
 @dataclass(frozen=True)
 class RLEnvironmentConfig:
     max_robots: int = MAX_ROBOTS
@@ -52,10 +52,12 @@ class RewardConfig:
 
 
 class SchedulingEnvironment:
-    """Snapshot encoder plus a small abstract assignment environment.
+    """Snapshot encoder plus a Webots-business-compatible headless runtime.
 
     Webots mode never commits domain state; scheduler adapters use observation
-    and mask only. Abstract mode operates on private deep copies for training.
+    and mask only. Headless mode operates on private deep copies for training.
+    ``abstract`` remains a compatibility alias for ``headless`` and no longer
+    uses the old distance/time event shortcut.
     """
 
     ROBOT_FEATURES = 8
@@ -64,12 +66,17 @@ class SchedulingEnvironment:
 
     def __init__(self, config: Optional[RLEnvironmentConfig] = None,
                  reward: Optional[RewardConfig] = None,
-                 simulation_mode: str = "abstract"):
-        if simulation_mode not in {"abstract", "webots"}:
-            raise ValueError("simulation_mode must be abstract or webots")
+                 simulation_mode: str = "headless",
+                 runtime_config: Optional[HeadlessRuntimeConfig] = None):
+        if simulation_mode not in {"abstract", "headless", "webots"}:
+            raise ValueError(
+                "simulation_mode must be abstract, headless or webots")
         self.config = config or RLEnvironmentConfig()
         self.reward_config = reward or RewardConfig()
-        self.simulation_mode = simulation_mode
+        self.requested_simulation_mode = simulation_mode
+        self.simulation_mode = (
+            "headless" if simulation_mode == "abstract" else simulation_mode)
+        self.runtime_config = runtime_config or HeadlessRuntimeConfig()
         self.action_dim = self.config.max_robots * self.config.max_tasks + 1
         self.no_op_action = self.action_dim - 1
         self.observation_dim = (
@@ -86,6 +93,7 @@ class SchedulingEnvironment:
         self._step = 0
         self._completed_ids = set()
         self._cost_matrix = None
+        self._runtime: Optional[HeadlessFactoryRuntime] = None
         self.rng = np.random.default_rng(0)
 
     def reset(self, robot_states: Optional[Dict[int, dict]] = None,
@@ -94,9 +102,11 @@ class SchedulingEnvironment:
               seed: Optional[int] = None) -> Tuple[np.ndarray, dict]:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        if self.simulation_mode == "abstract":
-            self._robots = deepcopy(robot_states or {})
-            self._tasks = deepcopy(tasks or [])
+        if self.simulation_mode == "headless":
+            # Copy the snapshot as one object graph so an active robot's
+            # current_task remains the canonical object in the copied queue.
+            self._robots, self._tasks = deepcopy((
+                robot_states or {}, tasks or []))
         else:
             self._robots = robot_states or {}
             self._tasks = tasks or []
@@ -107,18 +117,23 @@ class SchedulingEnvironment:
             bind(self._robots)
         self._step = 0
         self._completed_ids.clear()
-        self._refresh_slots()
         self._cost_matrix = None
-        # Mirror Supervisor's pre-dispatch battery guard for an initial
-        # snapshot that contains an idle low-battery robot.
-        for rid, state in self._robots.items():
-            if (state.get("state") == RobotState.IDLE and
-                    state.get("current_task") is None and
-                    float(state.get("battery", BATTERY_CAPACITY))
-                    < MIN_TASK_BATTERY):
-                self._schedule_charge_if_required(
-                    rid, float(self._context.current_time))
-        return self.observe(), {"environment_version": ENVIRONMENT_VERSION}
+        if self.simulation_mode == "headless":
+            self._runtime = HeadlessFactoryRuntime(
+                self._robots, self._tasks, self._context,
+                seed=0 if seed is None else int(seed),
+                config=self.runtime_config)
+            self._sync_runtime()
+        else:
+            self._runtime = None
+        self._refresh_slots()
+        return self.observe(), {
+            "environment_version": ENVIRONMENT_VERSION,
+            "simulation_mode": self.simulation_mode,
+            "dynamics_version": (
+                HEADLESS_DYNAMICS_VERSION
+                if self.simulation_mode == "headless" else "webots-live"),
+        }
 
     def set_snapshot(self, robot_states: Dict[int, dict],
                      tasks: List[TransportTask],
@@ -303,33 +318,47 @@ class SchedulingEnvironment:
         return result
 
     def step(self, action: int):
-        if self.simulation_mode != "abstract":
-            raise RuntimeError("step is only available in abstract mode")
+        if self.simulation_mode != "headless" or self._runtime is None:
+            raise RuntimeError("step is only available in headless mode")
         mask = self.get_action_mask()
         self._step += 1
         if not (0 <= action < self.action_dim) or not mask[action]:
             return self.observe(), self.reward_config.invalid_action, False, (
                 self._step >= self.config.max_steps_per_episode
-            ), {"invalid_action": True}
+            ), {"invalid_action": True,
+                "dynamics_version": HEADLESS_DYNAMICS_VERSION}
+
+        distance_before = float(
+            self._runtime.telemetry["distance_travelled"])
         if action == self.no_op_action:
             had_active = self._has_active_executions()
             had_future = self._has_future_arrivals()
-            completed = self._advance_to_next_completion()
-            terminated = self._is_terminal_state()
-            reward = (completed * self.reward_config.task_completion
-                      if completed else
-                      (0.0 if had_active or had_future
-                       else self.reward_config.no_op))
-            self._cost_matrix = None
-            return self.observe(), float(reward), terminated, False, {
-                "no_op": True, "completed_this_step": completed,
-                "completed_count": len(self._completed_ids)}
+            events = self._runtime.advance_until_event()
+            self._sync_runtime()
+            completed = sum(
+                event.get("type") == "task_completed" for event in events)
+            distance = (float(self._runtime.telemetry["distance_travelled"])
+                        - distance_before)
+            reward = self._event_reward(events, distance)
+            if not events and not had_active and not had_future:
+                reward += self.reward_config.no_op
+            return self.observe(), float(reward), self._is_terminal_state(), (
+                self._step >= self.config.max_steps_per_episode
+            ), {
+                "no_op": True,
+                "completed_this_step": completed,
+                "completed_count": len(self._completed_ids),
+                "runtime_events": events,
+                "distance_travelled": distance,
+                "dynamics_version": HEADLESS_DYNAMICS_VERSION,
+            }
+
         assignment = self.assignment_for_action(action)
         if assignment is None:
             return self.observe(), self.reward_config.invalid_action, False, False, {
-                "invalid_action": True}
+                "invalid_action": True,
+                "dynamics_version": HEADLESS_DYNAMICS_VERSION}
         task = assignment.task
-        robot = self._robots[assignment.robot_id]
         wait = max(0.0, self._context.current_time - task.arrival_time)
         reward = (
             self.reward_config.valid_assignment
@@ -337,173 +366,170 @@ class SchedulingEnvironment:
             + self.reward_config.age_bonus * min(
                 wait / max(self.reward_config.age_scale_seconds, 1e-6),
                 self.reward_config.max_age_bonus_units)
-            + self.reward_config.distance_weight * float(assignment.estimated_cost or 0)
             + self.reward_config.waiting_weight * min(
                 wait / max(self.reward_config.age_scale_seconds, 1e-6),
                 self.reward_config.max_age_bonus_units)
         )
-        # Commit the dispatch exactly as FactorySupervisor does. Completion is
-        # a later discrete event, so multiple robots can remain active at the
-        # same time instead of one robot completing every task instantaneously.
-        task.status = TaskStatus.ASSIGNED
-        task.assigned_robot = assignment.robot_id
-        task.assignment_time = self._context.current_time
-        robot["state"] = RobotState.EN_ROUTE_PICKUP
-        robot["current_task"] = task
-        robot["has_task"] = True
-        robot["goal_location"] = task.pickup_location
+        dispatch_event = self._runtime.dispatch(assignment)
+        events = [dispatch_event]
+        self._sync_runtime()
+        if dispatch_event.get("type") != "assignment_committed":
+            return self.observe(), self.reward_config.invalid_action, (
+                self._is_terminal_state()), (
+                self._step >= self.config.max_steps_per_episode), {
+                    "assignment_rejected": True,
+                    "reason": dispatch_event.get("reason", "unknown"),
+                    "runtime_events": events,
+                    "completed_count": len(self._completed_ids),
+                    "dynamics_version": HEADLESS_DYNAMICS_VERSION,
+                }
 
-        travel_distance = max(0.0, float(assignment.estimated_cost or 0.0))
-        travel_seconds = travel_distance / ABSTRACT_LINEAR_SPEED
-        pickup_distance = self._pickup_leg_distance(assignment)
-        pickup_seconds = pickup_distance / ABSTRACT_LINEAR_SPEED
-        robot["_abstract_execution"] = {
-            "kind": "task",
-            "task": task,
-            "pickup_time": self._context.current_time + pickup_seconds,
-            "completion_time": self._context.current_time + travel_seconds,
-            "distance": travel_distance,
-        }
-        self._cost_matrix = None
-
-        # When the fleet is saturated, advance to the next physical completion
-        # event. This is the event-driven equivalent of Webots continuing to
-        # step while no idle robot is available.
-        completed = 0
+        # Assign all currently possible work before advancing physical time.
         if not self.get_action_mask()[:-1].any():
-            completed = self._advance_to_next_completion()
-            reward += completed * self.reward_config.task_completion
+            events.extend(self._runtime.advance_until_event())
+            self._sync_runtime()
+        completed = sum(
+            event.get("type") == "task_completed" for event in events)
+        distance = (float(self._runtime.telemetry["distance_travelled"])
+                    - distance_before)
+        reward += self._event_reward(events, distance)
         terminated = self._is_terminal_state()
         truncated = self._step >= self.config.max_steps_per_episode
         return self.observe(), float(reward), bool(terminated), bool(truncated), {
             "assignment": (assignment.robot_id, task.task_id),
             "completed_this_step": completed,
             "completed_count": len(self._completed_ids),
+            "runtime_events": events,
+            "distance_travelled": distance,
+            "dynamics_version": HEADLESS_DYNAMICS_VERSION,
         }
 
-    def _advance_to_next_completion(self) -> int:
-        """Advance to the next task arrival or robot completion event."""
-        executions = [
-            (float(state["_abstract_execution"]["completion_time"]), rid)
-            for rid, state in self._robots.items()
-            if state.get("_abstract_execution") is not None]
-        now = float(self._context.current_time)
-        future_arrivals = [
-            float(task.arrival_time) for task in self._tasks
-            if task.status == TaskStatus.PENDING
-            and float(task.arrival_time) > now + 1e-9]
-        event_times = [item[0] for item in executions] + future_arrivals
-        if not event_times:
-            return 0
-        event_time = min(event_times)
-        self._context = replace(self._context, current_time=event_time)
-        completed = 0
-        for _, rid in executions:
-            robot = self._robots[rid]
-            execution = robot.get("_abstract_execution")
-            if (execution is None or
-                    float(execution["completion_time"]) > event_time + 1e-9):
-                continue
-            if execution.get("kind") == "charge":
-                journey_seconds = float(execution["journey_seconds"])
-                distance = float(execution["distance"])
-                robot["state"] = RobotState.CHARGING
-                robot["position"] = tuple(execution["position"])
-                robot["battery"] = max(
-                    0.0, float(robot["battery"])
-                    - BATTERY_DRAIN_RATE * journey_seconds)
-                robot["total_distance"] = (
-                    float(robot.get("total_distance", 0.0)) + distance)
-                robot["battery"] = float(self.rng.uniform(
-                    FULL_BATTERY_THRESHOLD, BATTERY_CAPACITY))
-                robot["state"] = RobotState.IDLE
-                robot["goal_location"] = None
-                robot.pop("_abstract_execution", None)
-                continue
-            task = execution["task"]
-            task.pickup_time = float(execution["pickup_time"])
-            task.status = TaskStatus.IN_PROGRESS
-            robot["state"] = RobotState.EN_ROUTE_DELIVERY
-            task.completion_time = event_time
-            task.status = TaskStatus.COMPLETED
-            robot["position"] = tuple(task.delivery_position)
-            travel_distance = float(execution["distance"])
-            travel_seconds = max(0.0, event_time - float(task.assignment_time))
-            robot["battery"] = max(
-                0.0, float(robot.get("battery", BATTERY_CAPACITY))
-                - BATTERY_DRAIN_RATE * travel_seconds)
-            robot["total_distance"] = (
-                float(robot.get("total_distance", 0.0)) + travel_distance)
-            robot["tasks_completed"] = int(
-                robot.get("tasks_completed", 0)) + 1
-            robot["current_task"] = None
-            robot["has_task"] = False
-            robot["goal_location"] = None
-            robot["state"] = RobotState.IDLE
-            robot.pop("_abstract_execution", None)
-            self._completed_ids.add(task.task_id)
-            completed += 1
-            self._schedule_charge_if_required(rid, event_time)
+    def _sync_runtime(self) -> None:
+        if self._runtime is None:
+            return
+        self._robots = self._runtime.robots
+        self._tasks = self._runtime.tasks
+        self._context = self._runtime.context
+        self._completed_ids = set(self._runtime.completed_ids)
         self._cost_matrix = None
-        return completed
+
+    def _event_reward(self, events, distance: float) -> float:
+        reward = self.reward_config.distance_weight * max(0.0, float(distance))
+        for event in events:
+            kind = event.get("type")
+            if kind == "task_completed":
+                reward += self.reward_config.task_completion
+            elif kind == "task_failed_battery":
+                reward += self.reward_config.invalid_action
+            elif kind == "deadlock_replan":
+                reward += self.reward_config.deadlock
+            elif kind == "collision":
+                reward += self.reward_config.collision
+        return float(reward)
 
     def _has_active_executions(self) -> bool:
-        return any(state.get("_abstract_execution") is not None
-                   for state in self._robots.values())
+        return bool(self._runtime and self._runtime.has_active_execution())
 
     def _has_future_arrivals(self) -> bool:
-        now = float(self._context.current_time)
-        return any(task.status == TaskStatus.PENDING
-                   and float(task.arrival_time) > now + 1e-9
-                   for task in self._tasks)
+        return bool(self._runtime and self._runtime.has_future_arrivals())
 
     def _is_terminal_state(self) -> bool:
-        pending = any(task.status == TaskStatus.PENDING for task in self._tasks)
-        return not pending and not self._has_active_executions()
-
-    def _pickup_leg_distance(self, assignment: Assignment) -> float:
-        provider = self._context.path_cost_provider
-        segment = getattr(provider, "segment", None)
-        if callable(segment):
-            return float(segment(
-                self._robots[assignment.robot_id]["position"],
-                assignment.task.pickup_position))
-        start = self._robots[assignment.robot_id]["position"]
-        goal = assignment.task.pickup_position
-        return math.hypot(goal[0] - start[0], goal[1] - start[1])
-
-    def _schedule_charge_if_required(self, robot_id: int,
-                                     current_time: float) -> bool:
-        robot = self._robots[robot_id]
-        if float(robot.get("battery", BATTERY_CAPACITY)) >= MIN_TASK_BATTERY:
-            return False
-        provider = self._context.path_cost_provider
-        segment = getattr(provider, "segment", None)
-        candidates = []
-        if callable(segment):
-            for name, position in CHARGING_STATIONS.items():
-                distance = float(segment(robot["position"], position))
-                if np.isfinite(distance):
-                    candidates.append((distance, name, position))
-        if not candidates:
-            for name, position in CHARGING_STATIONS.items():
-                distance = math.hypot(
-                    position[0] - robot["position"][0],
-                    position[1] - robot["position"][1])
-                candidates.append((distance, name, position))
-        distance, station, position = min(candidates, key=lambda item: item[0])
-        journey_seconds = distance / ABSTRACT_LINEAR_SPEED
-        robot["state"] = RobotState.RETURNING_TO_CHARGE
-        robot["goal_location"] = station
-        robot["_abstract_execution"] = {
-            "kind": "charge",
-            "completion_time": current_time + journey_seconds + 5.0,
-            "journey_seconds": journey_seconds,
-            "distance": distance,
-            "station": station,
-            "position": tuple(position),
-        }
-        return True
+        return bool(self._runtime and self._runtime.is_terminal())
 
     def is_terminal(self) -> bool:
         return self._is_terminal_state()
+
+    def runtime_telemetry(self) -> dict:
+        """Return a detached, JSON-safe execution summary for reports."""
+        if self._runtime is None:
+            if self.simulation_mode == "headless":
+                return {
+                    "runtime_mode": "headless_webots_logic",
+                    "dynamics_version": HEADLESS_DYNAMICS_VERSION,
+                    "physics_fidelity": "business_logic_only",
+                    "initialized": False,
+                }
+            return {
+                "runtime_mode": "webots_snapshot",
+                "dynamics_version": "webots-live",
+            }
+        result = self._runtime.telemetry_snapshot()
+        result["runtime_mode"] = "headless_webots_logic"
+        result["physics_fidelity"] = "business_logic_only"
+        result["initialized"] = True
+        return result
+
+    def step_scheduler(self, scheduler):
+        """Execute one decision from any project ``BaseScheduler``.
+
+        Matching schedulers may propose multiple assignments, just as they do
+        in Webots.  The Supervisor commits one result and schedules again from
+        the updated snapshot, so this adapter validates the entire proposal
+        then commits only its first assignment through ``step``.
+        """
+        if self.simulation_mode != "headless" or self._runtime is None:
+            raise RuntimeError(
+                "step_scheduler is only available in headless mode")
+        mask = self.get_action_mask()
+        if mask[self.no_op_action]:
+            transition = self.step(self.no_op_action)
+            info = dict(transition[4])
+            info.update({
+                "scheduler_name": getattr(scheduler, "name", type(scheduler).__name__),
+                "scheduler_no_op": True,
+            })
+            return transition[:4] + (info,)
+
+        pending = list(self._task_slots)
+        try:
+            decision = scheduler.assign(pending, self._robots, self._context)
+            valid, reason = validate_assignments(
+                decision.assignments, pending, self._robots, self._context)
+            if not decision.is_feasible or not valid:
+                selected = (decision.assignments[0]
+                            if decision.assignments else None)
+                scheduler.on_assignment_rejected(selected, reason)
+                return self._scheduler_rejection(
+                    scheduler, reason, getattr(decision, "diagnostics", {}))
+            selected = decision.assignments[0]
+            action = self.action_for_pair(
+                selected.robot_id, selected.task.task_id)
+        except Exception as exc:
+            reason = f"scheduler_adapter_error:{type(exc).__name__}"
+            try:
+                scheduler.on_assignment_rejected(None, reason)
+            except Exception:
+                pass
+            return self._scheduler_rejection(
+                scheduler, reason, {})
+
+        transition = self.step(action)
+        info = dict(transition[4])
+        if info.get("assignment_rejected") or info.get("invalid_action"):
+            scheduler.on_assignment_rejected(
+                selected, info.get("reason", "runtime_rejected"))
+        else:
+            scheduler.on_assignment_committed(selected)
+        info.update({
+            "scheduler_name": getattr(
+                decision, "algorithm_name", None) or
+                getattr(scheduler, "name", type(scheduler).__name__),
+            "scheduler_diagnostics": dict(
+                getattr(decision, "diagnostics", {}) or {}),
+            "scheduler_computation_time": float(
+                getattr(decision, "computation_time", 0.0)),
+        })
+        return transition[:4] + (info,)
+
+    def _scheduler_rejection(self, scheduler, reason: str, diagnostics: dict):
+        self._step += 1
+        name = getattr(scheduler, "name", type(scheduler).__name__)
+        return self.observe(), float(self.reward_config.invalid_action), False, (
+            self._step >= self.config.max_steps_per_episode), {
+                "scheduler_output_rejected": True,
+                "reason": str(reason),
+                "scheduler_name": name,
+                "scheduler_diagnostics": dict(diagnostics or {}),
+                "completed_count": len(self._completed_ids),
+                "dynamics_version": HEADLESS_DYNAMICS_VERSION,
+            }

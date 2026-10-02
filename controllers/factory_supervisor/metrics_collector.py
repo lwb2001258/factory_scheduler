@@ -19,7 +19,9 @@ import statistics
 import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
-from task_generator import TransportTask
+from config import (PRIORITY_MAX_COMPLETION_SECONDS,
+                    validate_priority_max_completion_seconds)
+from task_generator import TransportTask, task_manifest_sha256
 
 
 @dataclass
@@ -58,12 +60,24 @@ class MetricsCollector:
     
     def __init__(self, scenario_name: str, scheduler_name: str, num_robots: int,
                  seed: Optional[int] = None,
-                 runtime_mode: str = "unknown"):
+                 runtime_mode: str = "unknown",
+                 priority_2_max_completion_seconds: Optional[int] = None,
+                 priority_3_max_completion_seconds: Optional[int] = None):
         self.scenario_name = scenario_name
         self.scheduler_name = scheduler_name
         self.num_robots = num_robots
         self.seed = int(seed) if seed is not None else None
         self.runtime_mode = str(runtime_mode)
+        self.priority_2_max_completion_seconds = (
+            validate_priority_max_completion_seconds(
+                2, priority_2_max_completion_seconds
+                if priority_2_max_completion_seconds is not None else
+                PRIORITY_MAX_COMPLETION_SECONDS[2]))
+        self.priority_3_max_completion_seconds = (
+            validate_priority_max_completion_seconds(
+                3, priority_3_max_completion_seconds
+                if priority_3_max_completion_seconds is not None else
+                PRIORITY_MAX_COMPLETION_SECONDS[3]))
         
         # Time-series data
         self.step_records: List[StepRecord] = []
@@ -467,13 +481,9 @@ class MetricsCollector:
     
     def record_task_arrival(self, task: TransportTask, sim_time: float):
         """Record a new task arrival."""
-        self.task_arrivals.append({
-            'task_id': task.task_id,
-            'arrival_time': sim_time,
-            'pickup': task.pickup_location,
-            'delivery': task.delivery_location,
-            'priority': task.priority,
-        })
+        record = task.generation_parameters()
+        record['observed_at'] = float(sim_time)
+        self.task_arrivals.append(record)
     
     def record_task_completion(self, task: TransportTask, robot_id: int, sim_time: float):
         """Record a task completion."""
@@ -740,6 +750,7 @@ class MetricsCollector:
                 0.0, float(total_time) - snapshot['started_at'])
             active_wait_events.append(snapshot)
 
+        manifest_sha256 = task_manifest_sha256(self.task_arrivals)
         results = {
             "experiment_info": {
                 "scenario": self.scenario_name,
@@ -748,11 +759,18 @@ class MetricsCollector:
                 "seed": self.seed,
                 "runtime_mode": self.runtime_mode,
                 "sim_duration": total_time,
+                "task_manifest_sha256": manifest_sha256,
+                "task_manifest_count": len(self.task_arrivals),
+                "priority_2_max_completion_seconds": (
+                    self.priority_2_max_completion_seconds),
+                "priority_3_max_completion_seconds": (
+                    self.priority_3_max_completion_seconds),
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
             "summary_metrics": final_metrics,
             "task_stats": task_stats,
             "coordination_stats": coord_stats,
+            "task_arrivals": self.task_arrivals,
             "task_completions": self.task_completions,
             "conflict_events": self.conflict_events,
             "route_dispatch_events": self.route_dispatch_events,

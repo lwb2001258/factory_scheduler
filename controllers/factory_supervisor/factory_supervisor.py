@@ -2334,6 +2334,10 @@ class FactorySupervisor:
             num_robots=self.num_robots,
             seed=seed,
             runtime_mode="webots",
+            priority_2_max_completion_seconds=(
+                self.task_generator.priority_max_completion_seconds[2]),
+            priority_3_max_completion_seconds=(
+                self.task_generator.priority_max_completion_seconds[3]),
         )
         
         # Robot tracking

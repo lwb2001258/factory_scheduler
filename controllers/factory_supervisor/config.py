@@ -581,6 +581,62 @@ class TaskStatus:
     COMPLETED = "completed"
     FAILED = "failed"
 
+
+PRIORITY_COMPLETION_TIME_RANGES = {
+    2: (400, 450),
+    3: (250, 300),
+}
+
+
+def validate_priority_max_completion_seconds(priority, value):
+    """Validate one priority deadline and return its canonical value."""
+    if isinstance(priority, bool):
+        raise ValueError("task priority must be 1, 2, or 3")
+    try:
+        numeric_priority = float(priority)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("task priority must be 1, 2, or 3") from exc
+    if not math.isfinite(numeric_priority) or not numeric_priority.is_integer():
+        raise ValueError("task priority must be 1, 2, or 3")
+    canonical_priority = int(numeric_priority)
+    if canonical_priority not in (1, 2, 3):
+        raise ValueError("task priority must be 1, 2, or 3")
+    if canonical_priority == 1:
+        if value is not None:
+            raise ValueError("priority 1 must not have a completion deadline")
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"priority {canonical_priority} completion deadline must be an integer")
+    lower, upper = PRIORITY_COMPLETION_TIME_RANGES[canonical_priority]
+    if not lower <= value <= upper:
+        raise ValueError(
+            f"priority {canonical_priority} completion deadline must be "
+            f"between {lower} and {upper} seconds")
+    return value
+
+
+def _priority_deadline_from_env(priority, default):
+    name = f"SMART_FACTORY_PRIORITY_{priority}_MAX_COMPLETION_SECONDS"
+    raw = os.environ.get(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = int(raw.strip(), 10)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    return validate_priority_max_completion_seconds(priority, value)
+
+
+# Versioned task-level SLA configuration. These values define task metadata;
+# training reward/scoring integration is deliberately handled separately.
+PRIORITY_MAX_COMPLETION_SECONDS = {
+    1: None,
+    2: _priority_deadline_from_env(2, 425),
+    3: _priority_deadline_from_env(3, 275),
+}
+
 # ================================================================
 # EXPERIMENTAL SCENARIOS
 # ================================================================

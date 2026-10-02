@@ -1,4 +1,13 @@
 /tests/
+/tests/*
 /scripts/
+/scripts/*
 /results/
 /docs/
+/docs/*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/.test_tmp/
+/.test_tmp_safe/
+/tmp????????/

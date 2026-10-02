@@ -122,10 +122,12 @@ def factory_scenario(seed: int, max_robots=8, max_tasks=20,
         locations = {**STORAGE_AREAS, **WORKSTATIONS}
         if index:
             arrival_time += float(rng.exponential(mean_interval))
+        priority_roll = float(rng.random())
         tasks.append(TransportTask(
             index + 1, pickup, delivery, locations[pickup],
             locations[delivery], arrival_time,
-            priority=float(rng.uniform(1.0, 1.5))))
+            priority=(3 if priority_roll < 0.05 else
+                      2 if priority_roll < 0.25 else 1)))
     oracle = FactoryAStarCostOracle(robots, robot_count)
     return robots, tasks, SchedulingContext(
         current_time=0.0, path_cost_provider=oracle,

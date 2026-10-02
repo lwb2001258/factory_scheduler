@@ -5,14 +5,102 @@ Each task specifies a pickup location and delivery location within the factory.
 """
 
 import random
+import hashlib
+import json
 import math
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from config import (
     ALL_LOCATIONS, WORKSTATIONS, STORAGE_AREAS,
-    TaskStatus, SCENARIOS
+    PRIORITY_MAX_COMPLETION_SECONDS, TaskStatus,
+    validate_priority_max_completion_seconds,
 )
+
+
+TASK_GENERATION_PARAMETER_FIELDS = (
+    "task_id",
+    "pickup_location",
+    "delivery_location",
+    "pickup_position",
+    "delivery_position",
+    "arrival_time",
+    "priority",
+    "max_completion_time_seconds",
+    "deadline_time",
+)
+
+
+def canonical_task_manifest(entries) -> List[dict]:
+    """Validate and canonicalize task parameters for paired evaluation."""
+    canonical = []
+    expected_task_id = 1
+    for entry in entries:
+        missing = [field for field in TASK_GENERATION_PARAMETER_FIELDS
+                   if field not in entry]
+        if missing:
+            raise ValueError(
+                f"task manifest entry is missing fields: {missing}")
+        task_id = int(entry["task_id"])
+        if task_id != expected_task_id:
+            raise ValueError(
+                "task manifest IDs must be contiguous and ordered from 1")
+        expected_task_id += 1
+        priority_number = float(entry["priority"])
+        if (not math.isfinite(priority_number) or
+                not priority_number.is_integer()):
+            raise ValueError("task manifest priority must be 1, 2, or 3")
+        priority = int(priority_number)
+        arrival_time = float(entry["arrival_time"])
+        if not math.isfinite(arrival_time) or arrival_time < 0:
+            raise ValueError(
+                "task manifest arrival_time must be finite and nonnegative")
+        limit = validate_priority_max_completion_seconds(
+            priority, entry["max_completion_time_seconds"])
+        deadline = entry["deadline_time"]
+        if limit is None:
+            if deadline is not None:
+                raise ValueError(
+                    "priority 1 task manifest deadline must be null")
+            canonical_deadline = None
+        else:
+            canonical_deadline = float(deadline)
+            if (not math.isfinite(canonical_deadline) or
+                    not math.isclose(
+                        canonical_deadline, arrival_time + limit,
+                        rel_tol=0.0, abs_tol=1e-9)):
+                raise ValueError(
+                    "task manifest deadline must equal arrival plus limit")
+        pickup_position = [float(value)
+                           for value in entry["pickup_position"]]
+        delivery_position = [float(value)
+                             for value in entry["delivery_position"]]
+        if len(pickup_position) != 2 or len(delivery_position) != 2:
+            raise ValueError(
+                "task manifest positions must contain two coordinates")
+        if not all(math.isfinite(value) for value in
+                   pickup_position + delivery_position):
+            raise ValueError("task manifest positions must be finite")
+        canonical.append({
+            "task_id": task_id,
+            "pickup_location": str(entry["pickup_location"]),
+            "delivery_location": str(entry["delivery_location"]),
+            "pickup_position": pickup_position,
+            "delivery_position": delivery_position,
+            "arrival_time": arrival_time,
+            "priority": priority,
+            "max_completion_time_seconds": limit,
+            "deadline_time": canonical_deadline,
+        })
+    return canonical
+
+
+def task_manifest_sha256(entries) -> str:
+    """Return a stable hash of all scheduler-independent task parameters."""
+    payload = json.dumps(
+        canonical_task_manifest(entries), sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -30,6 +118,55 @@ class TransportTask:
     pickup_time: Optional[float] = None
     completion_time: Optional[float] = None
     priority: float = 1.0         # Higher = more urgent
+    max_completion_time_seconds: Optional[int] = None
+    deadline_time: Optional[float] = None
+    learning_trace: Optional[dict] = field(
+        default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        """Attach and validate scheduler-independent SLA metadata."""
+        numeric_priority = float(self.priority)
+        if (not math.isfinite(numeric_priority) or
+                not numeric_priority.is_integer()):
+            raise ValueError("task priority must be 1, 2, or 3")
+        priority = int(numeric_priority)
+        configured = self.max_completion_time_seconds
+        if priority in (2, 3) and configured is None:
+            configured = PRIORITY_MAX_COMPLETION_SECONDS[priority]
+        configured = validate_priority_max_completion_seconds(
+            priority, configured)
+        self.max_completion_time_seconds = configured
+        expected_deadline = (None if configured is None else
+                             float(self.arrival_time) + configured)
+        if self.deadline_time is None:
+            self.deadline_time = expected_deadline
+        elif expected_deadline is None or not math.isclose(
+                float(self.deadline_time), expected_deadline,
+                rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                "deadline_time must equal arrival_time plus the configured "
+                "maximum completion time")
+        elif self.deadline_time is not None:
+            self.deadline_time = float(self.deadline_time)
+
+    def generation_parameters(self) -> dict:
+        """Return scheduler-independent parameters used for paired runs."""
+        return {
+            "task_id": int(self.task_id),
+            "pickup_location": str(self.pickup_location),
+            "delivery_location": str(self.delivery_location),
+            "pickup_position": [float(value)
+                                for value in self.pickup_position],
+            "delivery_position": [float(value)
+                                  for value in self.delivery_position],
+            "arrival_time": float(self.arrival_time),
+            "priority": int(self.priority),
+            "max_completion_time_seconds": (
+                int(self.max_completion_time_seconds)
+                if self.max_completion_time_seconds is not None else None),
+            "deadline_time": (float(self.deadline_time)
+                              if self.deadline_time is not None else None),
+        }
 
     @property
     def waiting_time(self) -> Optional[float]:
@@ -63,14 +200,32 @@ class TaskGenerator:
     """
 
     def __init__(self, mean_interval: float, seed: int = 42,
-                 initial_task_immediately: bool = False):
+                 initial_task_immediately: bool = False,
+                 priority_max_completion_seconds=None):
         """
         Args:
             mean_interval: Mean time between task arrivals in seconds (lambda^-1).
             seed: Random seed for reproducibility.
+            priority_max_completion_seconds: Optional per-priority override.
         """
+        if not math.isfinite(mean_interval) or mean_interval <= 0:
+            raise ValueError("mean_interval must be finite and greater than zero")
         self.mean_interval = mean_interval
         self.rng = random.Random(seed)
+        configured_deadlines = dict(PRIORITY_MAX_COMPLETION_SECONDS)
+        if priority_max_completion_seconds is not None:
+            overrides = dict(priority_max_completion_seconds)
+            unknown_priorities = set(overrides) - {1, 2, 3}
+            if unknown_priorities:
+                raise ValueError(
+                    "deadline overrides contain unsupported priorities: "
+                    f"{sorted(unknown_priorities, key=str)}")
+            configured_deadlines.update(overrides)
+        self.priority_max_completion_seconds = {
+            priority: validate_priority_max_completion_seconds(
+                priority, configured_deadlines.get(priority))
+            for priority in (1, 2, 3)
+        }
         self.task_counter = 0
         self.next_arrival_time = 0.0
         self.tasks_generated: List[TransportTask] = []
@@ -128,6 +283,8 @@ class TaskGenerator:
             priority_roll = self.rng.random()
             
             self.task_counter += 1
+            priority = (3 if priority_roll < 0.05 else
+                        2 if priority_roll < 0.25 else 1)
             task = TransportTask(
                 task_id=self.task_counter,
                 pickup_location=pickup_loc,
@@ -135,8 +292,9 @@ class TaskGenerator:
                 pickup_position=ALL_LOCATIONS[pickup_loc],
                 delivery_position=ALL_LOCATIONS[delivery_loc],
                 arrival_time=current_time,
-                priority=(3 if priority_roll < 0.05 else
-                          2 if priority_roll < 0.25 else 1)
+                priority=priority,
+                max_completion_time_seconds=(
+                    self.priority_max_completion_seconds[priority])
             )
             
             self.tasks_generated.append(task)

@@ -19,7 +19,9 @@ import statistics
 import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
-from task_generator import TransportTask
+from config import (PRIORITY_MAX_COMPLETION_SECONDS,
+                    validate_priority_max_completion_seconds)
+from task_generator import TransportTask, task_manifest_sha256
 
 
 @dataclass
@@ -56,10 +58,26 @@ class MetricsCollector:
     Collects and manages all performance metrics during simulation.
     """
     
-    def __init__(self, scenario_name: str, scheduler_name: str, num_robots: int):
+    def __init__(self, scenario_name: str, scheduler_name: str, num_robots: int,
+                 seed: Optional[int] = None,
+                 runtime_mode: str = "unknown",
+                 priority_2_max_completion_seconds: Optional[int] = None,
+                 priority_3_max_completion_seconds: Optional[int] = None):
         self.scenario_name = scenario_name
         self.scheduler_name = scheduler_name
         self.num_robots = num_robots
+        self.seed = int(seed) if seed is not None else None
+        self.runtime_mode = str(runtime_mode)
+        self.priority_2_max_completion_seconds = (
+            validate_priority_max_completion_seconds(
+                2, priority_2_max_completion_seconds
+                if priority_2_max_completion_seconds is not None else
+                PRIORITY_MAX_COMPLETION_SECONDS[2]))
+        self.priority_3_max_completion_seconds = (
+            validate_priority_max_completion_seconds(
+                3, priority_3_max_completion_seconds
+                if priority_3_max_completion_seconds is not None else
+                PRIORITY_MAX_COMPLETION_SECONDS[3]))
         
         # Time-series data
         self.step_records: List[StepRecord] = []
@@ -123,16 +141,20 @@ class MetricsCollector:
         self.rl_fallback_decisions = 0
         
         # Output path
-        self.output_dir = os.path.join(
+        default_output_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
             "results"
         )
+        self.output_dir = os.path.abspath(os.environ.get(
+            "SMART_FACTORY_RESULTS_DIR", default_output_dir))
         os.makedirs(self.output_dir, exist_ok=True)
         
         timestamp = time.strftime("%Y%m%d_%H%M%S")
+        seed_suffix = f"_seed{self.seed}" if self.seed is not None else ""
         self.output_path = os.path.join(
             self.output_dir,
-            f"experiment_{scenario_name}_{scheduler_name}_{timestamp}.json"
+            f"experiment_{scenario_name}_{scheduler_name}{seed_suffix}_"
+            f"{timestamp}.json"
         )
 
     def record_scheduling_latency(self, seconds: float):
@@ -459,13 +481,9 @@ class MetricsCollector:
     
     def record_task_arrival(self, task: TransportTask, sim_time: float):
         """Record a new task arrival."""
-        self.task_arrivals.append({
-            'task_id': task.task_id,
-            'arrival_time': sim_time,
-            'pickup': task.pickup_location,
-            'delivery': task.delivery_location,
-            'priority': task.priority,
-        })
+        record = task.generation_parameters()
+        record['observed_at'] = float(sim_time)
+        self.task_arrivals.append(record)
     
     def record_task_completion(self, task: TransportTask, robot_id: int, sim_time: float):
         """Record a task completion."""
@@ -481,6 +499,9 @@ class MetricsCollector:
             'execution_time': task.execution_time,
             'pickup': task.pickup_location,
             'delivery': task.delivery_location,
+            'priority': task.priority,
+            'learning_trace': (dict(task.learning_trace)
+                               if task.learning_trace else None),
         })
     
     def record_conflict_scan(self, conflicts, sim_time: float) -> None:
@@ -729,17 +750,27 @@ class MetricsCollector:
                 0.0, float(total_time) - snapshot['started_at'])
             active_wait_events.append(snapshot)
 
+        manifest_sha256 = task_manifest_sha256(self.task_arrivals)
         results = {
             "experiment_info": {
                 "scenario": self.scenario_name,
                 "scheduler": self.scheduler_name,
                 "num_robots": self.num_robots,
+                "seed": self.seed,
+                "runtime_mode": self.runtime_mode,
                 "sim_duration": total_time,
+                "task_manifest_sha256": manifest_sha256,
+                "task_manifest_count": len(self.task_arrivals),
+                "priority_2_max_completion_seconds": (
+                    self.priority_2_max_completion_seconds),
+                "priority_3_max_completion_seconds": (
+                    self.priority_3_max_completion_seconds),
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
             "summary_metrics": final_metrics,
             "task_stats": task_stats,
             "coordination_stats": coord_stats,
+            "task_arrivals": self.task_arrivals,
             "task_completions": self.task_completions,
             "conflict_events": self.conflict_events,
             "route_dispatch_events": self.route_dispatch_events,

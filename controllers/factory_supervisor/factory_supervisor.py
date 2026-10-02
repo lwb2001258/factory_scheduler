@@ -64,7 +64,9 @@ from config import (
     INITIAL_BATTERY_MIN, INITIAL_BATTERY_MAX,
     LOG_INTERVAL, LOCATION_TO_NODE
 )
-from task_generator import TaskGenerator, TransportTask
+from task_generator import (TaskGenerator, TransportTask,
+                            canonical_task_manifest_document,
+                            load_task_manifest)
 from motion_coordinator import MotionCoordinator
 from schedulers import (
     create_scheduler, BaseScheduler, GreedyScheduler, HungarianScheduler,
@@ -75,6 +77,46 @@ from learning_scheduler import attach_learning_trace
 from startup_gate import StartupGate
 from metrics_collector import MetricsCollector, SafetyEvent
 from joint_plan_transaction import JointPlanTransaction
+from training_scenarios import formal_scenario_config
+
+
+def _validate_runtime_task_manifest(document, *, scenario: str, seed: int,
+                                    timestep_ms: int,
+                                    duration_seconds: float,
+                                    initial_task_immediately: bool) -> dict:
+    """Bind a canonical manifest to the exact Webots runtime contract."""
+    canonical = canonical_task_manifest_document(document)
+    metadata = canonical["metadata"]
+    if (metadata["scenario_id"] != scenario or
+            metadata["seed"] != seed or
+            metadata["timestep_ms"] != timestep_ms or
+            not math.isclose(
+                metadata["duration_seconds"], float(duration_seconds),
+                rel_tol=0.0, abs_tol=1e-9) or
+            metadata["initial_task_immediately"] !=
+            initial_task_immediately or
+            metadata["scenario_config"] != formal_scenario_config(scenario)):
+        raise ValueError(
+            "SMART_FACTORY_TASK_MANIFEST does not match this run")
+    return canonical
+
+
+def _canonical_simulation_time(step_count: int, timestep_ms: int,
+                               duration_seconds: float,
+                               auto_stop: bool) -> float:
+    """Derive simulation time without cumulative floating-point drift."""
+    if (isinstance(step_count, bool) or not isinstance(step_count, int) or
+            step_count < 0 or isinstance(timestep_ms, bool) or
+            not isinstance(timestep_ms, int) or timestep_ms <= 0 or
+            isinstance(duration_seconds, bool) or
+            not isinstance(duration_seconds, (int, float)) or
+            not math.isfinite(float(duration_seconds)) or
+            duration_seconds <= 0 or not isinstance(auto_stop, bool)):
+        raise ValueError("invalid simulation clock configuration")
+    elapsed = step_count * (timestep_ms / 1000.0)
+    if auto_stop and elapsed >= float(duration_seconds):
+        return float(duration_seconds)
+    return elapsed
 
 
 class RobotInfo:
@@ -2311,11 +2353,29 @@ class FactorySupervisor:
         self.first_dispatch_time = None
         
         # Initialize components
+        manifest_path = os.environ.get(
+            "SMART_FACTORY_TASK_MANIFEST", "").strip()
+        self.task_manifest_document = None
+        manifest_entries = None
+        deadline_config = None
+        if manifest_path:
+            document = _validate_runtime_task_manifest(
+                load_task_manifest(manifest_path), scenario=scenario,
+                seed=seed, timestep_ms=self.timestep,
+                duration_seconds=SIM_DURATION,
+                initial_task_immediately=self.scenario_config.get(
+                    "initial_task_immediately", False))
+            metadata = document["metadata"]
+            self.task_manifest_document = document
+            manifest_entries = document["tasks"]
+            deadline_config = metadata["deadline_config"]
         self.task_generator = TaskGenerator(
             mean_interval=self.scenario_config['task_interval'],
             seed=seed,
             initial_task_immediately=self.scenario_config.get(
-                'initial_task_immediately', False)
+                'initial_task_immediately', False),
+            priority_max_completion_seconds=deadline_config,
+            manifest_entries=manifest_entries,
         )
         self.motion_coordinator = MotionCoordinator(num_active_robots=self.num_robots)
         self.scheduler = create_scheduler(
@@ -2339,6 +2399,11 @@ class FactorySupervisor:
             priority_3_max_completion_seconds=(
                 self.task_generator.priority_max_completion_seconds[3]),
         )
+        if self.task_manifest_document is not None:
+            self.metrics.configure_expected_task_manifest(
+                self.task_manifest_document["task_manifest_sha256"],
+                self.task_manifest_document["manifest_sha256"],
+                len(self.task_manifest_document["tasks"]))
         
         # Robot tracking
         self.robots: Dict[int, RobotInfo] = {}
@@ -6313,8 +6378,10 @@ class FactorySupervisor:
             step_status = self.supervisor.step(self.timestep)
             if step_status == -1:
                 break
-            self.sim_time += dt
             self.step_count += 1
+            self.sim_time = _canonical_simulation_time(
+                self.step_count, self.timestep, SIM_DURATION,
+                AUTO_STOP_SIMULATION)
             self.motion_coordinator.set_sim_time(self.sim_time)
             
             # Check simulation end

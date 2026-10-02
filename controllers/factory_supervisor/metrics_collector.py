@@ -62,12 +62,26 @@ class MetricsCollector:
                  seed: Optional[int] = None,
                  runtime_mode: str = "unknown",
                  priority_2_max_completion_seconds: Optional[int] = None,
-                 priority_3_max_completion_seconds: Optional[int] = None):
+                 priority_3_max_completion_seconds: Optional[int] = None,
+                 physical_collision_observable: bool = False):
+        if (isinstance(num_robots, bool) or not isinstance(num_robots, int)
+                or num_robots <= 0):
+            raise ValueError("num_robots must be a positive integer")
+        if not isinstance(physical_collision_observable, bool):
+            raise ValueError("physical_collision_observable must be boolean")
+        if (seed is not None and
+                (isinstance(seed, bool) or not isinstance(seed, int))):
+            raise ValueError("seed must be an integer or null")
         self.scenario_name = scenario_name
         self.scheduler_name = scheduler_name
         self.num_robots = num_robots
         self.seed = int(seed) if seed is not None else None
         self.runtime_mode = str(runtime_mode)
+        if (physical_collision_observable and
+                self.runtime_mode != "webots"):
+            raise ValueError(
+                "physical collision telemetry requires Webots runtime")
+        self.physical_collision_observable = physical_collision_observable
         self.priority_2_max_completion_seconds = (
             validate_priority_max_completion_seconds(
                 2, priority_2_max_completion_seconds
@@ -130,6 +144,7 @@ class MetricsCollector:
         self.safety_events: List[dict] = []
         self._last_safety_event: Dict[tuple, float] = {}
         self.scheduling_latencies_ms: List[float] = []
+        self.scheduler_timeout_count = 0
         self.invalid_scheduler_outputs = 0
         self.scheduler_fallbacks = 0
         self.native_scheduler_commits = 0
@@ -139,6 +154,11 @@ class MetricsCollector:
         self.rl_timeout_count = 0
         self.rl_policy_decisions = 0
         self.rl_fallback_decisions = 0
+        self.physical_collision_count = 0
+        self.robot_exposure: Dict[int, dict] = {}
+        self.expected_task_manifest_sha256 = None
+        self.expected_manifest_sha256 = None
+        self.expected_task_manifest_count = None
         
         # Output path
         default_output_dir = os.path.join(
@@ -158,32 +178,104 @@ class MetricsCollector:
         )
 
     def record_scheduling_latency(self, seconds: float):
-        if math.isfinite(seconds) and seconds >= 0:
-            self.scheduling_latencies_ms.append(seconds * 1000.0)
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not math.isfinite(seconds) or seconds < 0):
+            raise ValueError("scheduling latency must be finite and nonnegative")
+        self.scheduling_latencies_ms.append(float(seconds) * 1000.0)
+
+    def configure_expected_task_manifest(
+            self, task_hash: str, manifest_hash: str, task_count: int):
+        if (not isinstance(task_hash, str) or len(task_hash) != 64 or
+                not isinstance(manifest_hash, str) or len(manifest_hash) != 64
+                or isinstance(task_count, bool)
+                or not isinstance(task_count, int) or task_count < 0):
+            raise ValueError("invalid expected task manifest metadata")
+        self.expected_task_manifest_sha256 = task_hash
+        self.expected_manifest_sha256 = manifest_hash
+        self.expected_task_manifest_count = task_count
+
+    def record_scheduler_timeout(self, count: int = 1):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("scheduler timeout count must be nonnegative")
+        self.scheduler_timeout_count += count
+
+    def record_physical_collision(self, count: int = 1):
+        """Record trusted rigid-body collision episodes only when observable."""
+        if not self.physical_collision_observable:
+            raise RuntimeError("physical collision telemetry is unobservable")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("physical collision count must be nonnegative")
+        self.physical_collision_count += count
+
+    def record_robot_exposure(
+            self, robot_id: int, *, task_busy_seconds: float,
+            available_seconds: float, charging_seconds: float = 0.0,
+            recovery_seconds: float = 0.0,
+            completed_priority_weight: float = 0.0):
+        """Install exact per-robot exposure counters for load diagnostics."""
+        if isinstance(robot_id, bool) or not isinstance(robot_id, int):
+            raise ValueError("robot_id must be an integer")
+        values = {
+            "task_busy_seconds": task_busy_seconds,
+            "available_seconds": available_seconds,
+            "charging_seconds": charging_seconds,
+            "recovery_seconds": recovery_seconds,
+            "completed_priority_weight": completed_priority_weight,
+        }
+        canonical = {}
+        for name, value in values.items():
+            if (isinstance(value, bool) or
+                    not isinstance(value, (int, float)) or
+                    not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+            canonical[name] = float(value)
+        if canonical["task_busy_seconds"] > canonical["available_seconds"]:
+            raise ValueError("task busy time cannot exceed available time")
+        self.robot_exposure[robot_id] = canonical
 
     def record_scheduler_fallback(self, invalid_output: bool = True):
+        if not isinstance(invalid_output, bool):
+            raise ValueError("invalid_output must be boolean")
         self.scheduler_fallbacks += 1
         if invalid_output:
             self.invalid_scheduler_outputs += 1
 
     def record_rl_diagnostics(self, diagnostics: Optional[dict]):
         """Capture safety-wrapper diagnostics for auditable RL evaluation."""
-        diagnostics = diagnostics or {}
+        if diagnostics is None:
+            diagnostics = {}
+        elif not isinstance(diagnostics, dict):
+            raise ValueError("RL diagnostics must be a mapping")
         inference_ms = diagnostics.get("inference_ms")
-        if isinstance(inference_ms, (int, float)) and math.isfinite(inference_ms):
+        if inference_ms is not None:
+            if (isinstance(inference_ms, bool) or
+                    not isinstance(inference_ms, (int, float)) or
+                    not math.isfinite(inference_ms) or inference_ms < 0):
+                raise ValueError("RL inference latency must be finite and nonnegative")
             self.rl_inference_latencies_ms.append(float(inference_ms))
+        counters = {}
+        for name in ("timeout_count", "policy_decisions",
+                     "fallback_decisions"):
+            value = diagnostics.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+            counters[name] = value
         self.rl_timeout_count = max(
-            self.rl_timeout_count, int(diagnostics.get("timeout_count", 0)))
+            self.rl_timeout_count, counters["timeout_count"])
+        self.scheduler_timeout_count = max(
+            self.scheduler_timeout_count, self.rl_timeout_count)
         self.rl_policy_decisions = max(
             self.rl_policy_decisions,
-            int(diagnostics.get("policy_decisions", 0)))
+            counters["policy_decisions"])
         self.rl_fallback_decisions = max(
             self.rl_fallback_decisions,
-            int(diagnostics.get("fallback_decisions", 0)))
+            counters["fallback_decisions"])
 
     def record_scheduler_commit(self, algorithm_name: str,
                                 native: bool = True):
         """Attribute committed work to the algorithm that actually chose it."""
+        if not isinstance(native, bool):
+            raise ValueError("native must be boolean")
         if native:
             self.native_scheduler_commits += 1
         else:
@@ -204,13 +296,43 @@ class MetricsCollector:
         self._cap_events(self.unauthorized_route_write_events)
 
     @staticmethod
-    def _percentile(values: List[float], percentile: float) -> float:
+    def _percentile(values: List[float], percentile: float) -> Optional[float]:
         if not values:
-            return 0.0
+            return None
         ordered = sorted(values)
         index = min(len(ordered) - 1,
                     max(0, math.ceil(percentile * len(ordered)) - 1))
         return ordered[index]
+
+    @staticmethod
+    def _poisson_upper_95(count: int) -> float:
+        """One-sided exact Poisson 95% upper bound for the event mean."""
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("Poisson count must be a nonnegative integer")
+        alpha = 0.05
+        if count == 0:
+            return -math.log(alpha)
+
+        def cdf(mean):
+            term = math.exp(
+                -mean + count * math.log(mean) - math.lgamma(count + 1))
+            total = term
+            for value in range(count, 0, -1):
+                term *= value / mean
+                total += term
+            return total
+
+        lower = float(count)
+        upper = max(1.0, float(count + 1))
+        while cdf(upper) > alpha:
+            upper *= 2.0
+        for _ in range(80):
+            middle = (lower + upper) / 2.0
+            if cdf(middle) > alpha:
+                lower = middle
+            else:
+                upper = middle
+        return upper
     
     def record_step(self, sim_time: float, robot_states: Dict[int, dict],
                     task_stats: dict, coord_stats: dict):
@@ -606,8 +728,24 @@ class MetricsCollector:
         
         Returns comprehensive metrics dictionary.
         """
+        if (isinstance(total_time, bool) or
+                not isinstance(total_time, (int, float)) or
+                not math.isfinite(total_time) or total_time <= 0):
+            raise ValueError("total_time must be finite and positive")
+        if not isinstance(robots, dict) or not robots:
+            raise ValueError("robots must be a non-empty mapping")
+        if len(robots) != self.num_robots:
+            raise ValueError("robot count differs from experiment metadata")
+        total_time = float(total_time)
+        for name in ("completed", "total_generated"):
+            value = task_stats.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"task_stats[{name}] must be nonnegative")
+        if task_stats.get("completed", 0) > task_stats.get("total_generated", 0):
+            raise ValueError("completed tasks cannot exceed generated tasks")
+
         # Throughput
-        throughput = task_stats.get('completed', 0) / max(total_time / 60.0, 1)  # per minute
+        throughput = task_stats.get('completed', 0) / (total_time / 60.0)
         
         # Average task completion time
         completion_times = [tc['completion_duration'] for tc in self.task_completions 
@@ -625,10 +763,25 @@ class MetricsCollector:
         tasks_per_robot = []
         
         for rid, robot in robots.items():
-            idle_pct = (robot.idle_time / max(total_time, 1)) * 100
+            numeric = {}
+            for name in ("idle_time", "total_distance"):
+                value = getattr(robot, name, None)
+                if (isinstance(value, bool) or
+                        not isinstance(value, (int, float)) or
+                        not math.isfinite(value) or value < 0):
+                    raise ValueError(
+                        f"robot {rid} {name} must be finite and nonnegative")
+                numeric[name] = float(value)
+            completed_count = getattr(robot, "tasks_completed", None)
+            if (isinstance(completed_count, bool) or
+                    not isinstance(completed_count, int) or
+                    completed_count < 0):
+                raise ValueError(
+                    f"robot {rid} tasks_completed must be nonnegative")
+            idle_pct = (numeric["idle_time"] / total_time) * 100
             robot_idle_pcts.append(idle_pct)
-            total_distance += robot.total_distance
-            tasks_per_robot.append(robot.tasks_completed)
+            total_distance += numeric["total_distance"]
+            tasks_per_robot.append(completed_count)
         
         avg_idle_pct = sum(robot_idle_pcts) / max(len(robot_idle_pcts), 1)
         
@@ -639,6 +792,55 @@ class MetricsCollector:
             workload_cv = (variance ** 0.5) / max(mean_tasks, 1)
         else:
             workload_cv = 0.0
+
+        robot_ids = set(robots)
+        exposure_ids = set(self.robot_exposure)
+        exposure_report = {
+            str(robot_id): dict(values)
+            for robot_id, values in sorted(self.robot_exposure.items())
+        }
+        normalized_loads = {}
+        if not self.robot_exposure:
+            availability_status = "unobserved"
+            availability_cv = None
+        elif exposure_ids != robot_ids:
+            availability_status = "incomplete_robot_coverage"
+            availability_cv = None
+        elif any(values["available_seconds"] <= 0
+                 for values in self.robot_exposure.values()):
+            availability_status = "insufficient_available_time"
+            availability_cv = None
+        else:
+            if any(
+                    values[name] > total_time
+                    for values in self.robot_exposure.values()
+                    for name in (
+                        "task_busy_seconds", "available_seconds",
+                        "charging_seconds", "recovery_seconds")):
+                raise ValueError("robot exposure exceeds episode duration")
+            normalized_loads = {
+                str(robot_id): values["task_busy_seconds"]
+                / values["available_seconds"]
+                for robot_id, values in sorted(self.robot_exposure.items())
+            }
+            mean_load = statistics.fmean(normalized_loads.values())
+            if mean_load == 0.0:
+                availability_status = "zero_mean_load"
+                availability_cv = None
+            else:
+                availability_status = "observed"
+                availability_cv = (
+                    statistics.pstdev(normalized_loads.values()) / mean_load)
+
+        robot_hours = len(robots) * total_time / 3600.0
+        physical_count = (self.physical_collision_count
+                          if self.physical_collision_observable else None)
+        collision_per_robot_hour = (
+            physical_count / robot_hours
+            if physical_count is not None and robot_hours > 0 else None)
+        collision_upper_per_robot_hour = (
+            self._poisson_upper_95(physical_count) / robot_hours
+            if physical_count is not None and robot_hours > 0 else None)
         
         latency = self.scheduling_latencies_ms
         completion_marks = sorted(
@@ -688,11 +890,37 @@ class MetricsCollector:
                 if math.isfinite(self.minimum_pair_distance_seen) else None),
             "pair_distance_violations": (
                 self.pair_distance_violation_samples),
+            "physical_collision_observation_status": (
+                "observed" if self.physical_collision_observable
+                else "unobserved"),
+            "physical_collision_count": physical_count,
+            "robot_hours": robot_hours,
+            "physical_collisions_per_robot_hour": (
+                collision_per_robot_hour),
+            "physical_collision_rate_upper_95_per_robot_hour": (
+                collision_upper_per_robot_hour),
+            "physical_collisions_per_1000m": (
+                physical_count / (total_distance / 1000.0)
+                if physical_count is not None and total_distance > 0
+                else None),
+            "physical_collision_rate_upper_95_per_1000m": (
+                self._poisson_upper_95(physical_count)
+                / (total_distance / 1000.0)
+                if physical_count is not None and total_distance > 0
+                else None),
+            "pair_distance_violations_per_robot_hour": (
+                self.pair_distance_violation_samples / robot_hours),
+            "nonphysical_recoveries_per_robot_hour": (
+                self.nonphysical_recoveries / robot_hours),
             
             # Secondary metrics
             "max_completion_time": max(completion_times) if completion_times else 0,
             "min_completion_time": min(completion_times) if completion_times else 0,
             "workload_balance_cv": workload_cv,
+            "availability_adjusted_load_cv": availability_cv,
+            "availability_load_observation_status": availability_status,
+            "normalized_load_by_robot": normalized_loads,
+            "robot_exposure_by_robot": exposure_report,
             "tasks_per_robot": tasks_per_robot,
             "robot_idle_percentages": robot_idle_pcts,
             "total_replans": coord_stats.get('total_replans', 0),
@@ -710,11 +938,12 @@ class MetricsCollector:
             "robots_without_completed_tasks": sum(
                 1 for count in tasks_per_robot if count == 0),
             "scheduling_latency_mean_ms": (
-                statistics.fmean(latency) if latency else 0.0),
+                statistics.fmean(latency) if latency else None),
             "scheduling_latency_p50_ms": self._percentile(latency, 0.50),
             "scheduling_latency_p95_ms": self._percentile(latency, 0.95),
             "scheduling_latency_p99_ms": self._percentile(latency, 0.99),
-            "scheduling_latency_max_ms": max(latency, default=0.0),
+            "scheduling_latency_max_ms": max(latency) if latency else None,
+            "scheduler_timeout_count": self.scheduler_timeout_count,
             "invalid_scheduler_outputs": self.invalid_scheduler_outputs,
             "scheduler_fallbacks": self.scheduler_fallbacks,
             "native_scheduler_commits": self.native_scheduler_commits,
@@ -725,15 +954,18 @@ class MetricsCollector:
             "rl_fallback_decisions": self.rl_fallback_decisions,
             "rl_fallback_rate": (
                 self.rl_fallback_decisions /
-                max(1, self.rl_policy_decisions + self.rl_fallback_decisions)),
+                (self.rl_policy_decisions + self.rl_fallback_decisions)
+                if self.rl_policy_decisions + self.rl_fallback_decisions > 0
+                else None),
             "rl_timeout_count": self.rl_timeout_count,
             "rl_inference_mean_ms": (
                 statistics.fmean(self.rl_inference_latencies_ms)
-                if self.rl_inference_latencies_ms else 0.0),
+                if self.rl_inference_latencies_ms else None),
             "rl_inference_p95_ms": self._percentile(
                 self.rl_inference_latencies_ms, 0.95),
-            "rl_inference_max_ms": max(
-                self.rl_inference_latencies_ms, default=0.0),
+            "rl_inference_max_ms": (
+                max(self.rl_inference_latencies_ms)
+                if self.rl_inference_latencies_ms else None),
         }
     
     def save_results(self, robots: dict, task_stats: dict,
@@ -751,6 +983,10 @@ class MetricsCollector:
             active_wait_events.append(snapshot)
 
         manifest_sha256 = task_manifest_sha256(self.task_arrivals)
+        manifest_matches = (
+            True if self.expected_task_manifest_sha256 is None else
+            manifest_sha256 == self.expected_task_manifest_sha256 and
+            len(self.task_arrivals) == self.expected_task_manifest_count)
         results = {
             "experiment_info": {
                 "scenario": self.scenario_name,
@@ -761,6 +997,12 @@ class MetricsCollector:
                 "sim_duration": total_time,
                 "task_manifest_sha256": manifest_sha256,
                 "task_manifest_count": len(self.task_arrivals),
+                "expected_task_manifest_sha256": (
+                    self.expected_task_manifest_sha256),
+                "expected_manifest_sha256": self.expected_manifest_sha256,
+                "expected_task_manifest_count": (
+                    self.expected_task_manifest_count),
+                "task_manifest_matches_expected": manifest_matches,
                 "priority_2_max_completion_seconds": (
                     self.priority_2_max_completion_seconds),
                 "priority_3_max_completion_seconds": (

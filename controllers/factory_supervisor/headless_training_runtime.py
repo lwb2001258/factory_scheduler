@@ -39,6 +39,8 @@ class HeadlessRuntimeConfig:
     deadlock_scan_seconds: float = 0.5
     retry_route_seconds: float = 1.0
     max_advance_seconds: float = 1800.0
+    episode_end_time: float = 1800.0
+    fixed_horizon: bool = False
 
     def __post_init__(self):
         finite_positive = (
@@ -46,10 +48,14 @@ class HeadlessRuntimeConfig:
             self.battery_swap_seconds, self.assignment_failure_ttl,
             self.lifelong_tick_seconds, self.deadlock_scan_seconds,
             self.retry_route_seconds, self.max_advance_seconds,
+            self.episode_end_time,
         )
-        if any(not math.isfinite(value) or value <= 0
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) or value <= 0
                for value in finite_positive):
             raise ValueError("headless runtime constants must be finite and positive")
+        if not isinstance(self.fixed_horizon, bool):
+            raise ValueError("fixed_horizon must be boolean")
 
 
 def _polyline_length(start: Tuple[float, float],
@@ -109,14 +115,22 @@ class HeadlessFactoryRuntime:
         task_ids = [task.task_id for task in tasks]
         if len(set(task_ids)) != len(task_ids):
             raise ValueError("duplicate task IDs")
-        if not math.isfinite(float(context.current_time)):
+        if (isinstance(context.current_time, bool) or
+                not isinstance(context.current_time, (int, float)) or
+                not math.isfinite(float(context.current_time))):
             raise ValueError("non-finite initial time")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("headless runtime seed must be an integer")
 
         self.config = config or HeadlessRuntimeConfig()
         self.robots = robot_states
         self.tasks = tasks
         self._base_context = context
         self.current_time = float(context.current_time)
+        if self.current_time < 0 or self.current_time >= self.config.episode_end_time:
+            raise ValueError("initial time must lie inside the episode horizon")
+        self._tick_seconds = self.config.timestep_seconds
+        self._horizon_finalized = False
         self.rng = np.random.default_rng(int(seed))
         self.coordinator = MotionCoordinator(
             num_active_robots=max(1, len(robot_states)))
@@ -143,6 +157,7 @@ class HeadlessFactoryRuntime:
             task.task_id for task in tasks
             if task.status == TaskStatus.PENDING
             and float(task.arrival_time) <= self.current_time + 1e-9
+            and float(task.arrival_time) < self.config.episode_end_time
         }
         self._completed_ids = {
             task.task_id for task in tasks
@@ -224,12 +239,14 @@ class HeadlessFactoryRuntime:
             task for task in self.tasks
             if task.status == TaskStatus.PENDING
             and float(task.arrival_time) <= self.current_time + 1e-9
+            and float(task.arrival_time) < self.config.episode_end_time
         ]
 
     def has_future_arrivals(self) -> bool:
         return any(
             task.status == TaskStatus.PENDING
             and float(task.arrival_time) > self.current_time + 1e-9
+            and float(task.arrival_time) < self.config.episode_end_time
             for task in self.tasks)
 
     def has_active_execution(self) -> bool:
@@ -242,7 +259,14 @@ class HeadlessFactoryRuntime:
         return any(state.get("state") in active for state in self.robots.values())
 
     def is_terminal(self) -> bool:
-        pending = any(task.status == TaskStatus.PENDING for task in self.tasks)
+        if self.current_time + 1e-9 >= self.config.episode_end_time:
+            return True
+        if self.config.fixed_horizon:
+            return False
+        pending = any(
+            task.status == TaskStatus.PENDING
+            and task.arrival_time < self.config.episode_end_time
+            for task in self.tasks)
         assigned = any(task.status in (TaskStatus.ASSIGNED,
                                        TaskStatus.IN_PROGRESS)
                        for task in self.tasks)
@@ -305,10 +329,30 @@ class HeadlessFactoryRuntime:
                     "robot_id": rid, "task_id": task.task_id}
 
         state = self.robots[rid]
+        provider = self.context.path_cost_provider
+        ideal_distance = None
+        if provider is not None:
+            ideal_distance = float(provider(rid, task))
+            if not math.isfinite(ideal_distance) or ideal_distance < 0:
+                self.coordinator.rollback_robot_plan(rid)
+                self.telemetry["assignments_rejected"] += 1
+                return {"type": "assignment_rejected",
+                        "reason": "invalid_ideal_distance",
+                        "robot_id": rid, "task_id": task.task_id}
+        elif assignment.estimated_cost is not None:
+            ideal_distance = float(assignment.estimated_cost)
         self.coordinator.release_home(rid)
         task.status = TaskStatus.ASSIGNED
         task.assigned_robot = rid
-        task.assignment_time = self.current_time
+        # Arrival ticks are generated by multiplication while runtime ticks
+        # are accumulated.  Canonicalize sub-nanosecond drift so a task made
+        # available by the tolerance can never appear assigned before arrival.
+        task.assignment_time = max(
+            float(self.current_time), float(task.arrival_time))
+        task.ideal_distance = ideal_distance
+        task.actual_distance = 0.0
+        task.excess_distance_cursor = 0.0
+        task.rewarded_excess_distance_cursor = 0.0
         state["current_task"] = task
         state["has_task"] = True
         state["state"] = RobotState.EN_ROUTE_PICKUP
@@ -319,6 +363,7 @@ class HeadlessFactoryRuntime:
         return {
             "type": "assignment_committed", "reason": "ok",
             "robot_id": rid, "task_id": task.task_id,
+            "ideal_distance": ideal_distance,
             "planned_pickup_distance": _polyline_length(
                 state["position"], path),
         }
@@ -394,8 +439,6 @@ class HeadlessFactoryRuntime:
         events = []
         if task is not None:
             task.status = TaskStatus.FAILED
-            task.assigned_robot = None
-            task.assignment_time = None
             events.append({"type": "task_failed_battery", "robot_id": rid,
                            "task_id": task.task_id})
             self.telemetry["tasks_failed_battery"] += 1
@@ -426,7 +469,7 @@ class HeadlessFactoryRuntime:
                 RobotState.EN_ROUTE_DELIVERY, RobotState.RETURNING_HOME}:
             state["battery"] = max(
                 0.0, float(state["battery"])
-                - BATTERY_DRAIN_RATE * self.config.timestep_seconds)
+                - BATTERY_DRAIN_RATE * self._tick_seconds)
 
         if (state["battery"] < LOW_BATTERY_THRESHOLD and
                 state.get("state") not in {
@@ -475,6 +518,7 @@ class HeadlessFactoryRuntime:
         self.telemetry["tasks_completed"] += 1
         events = [{"type": "task_completed", "robot_id": rid,
                    "task_id": task.task_id}]
+        events.extend(task.deadline_events(self.current_time))
         if state["battery"] < LOW_BATTERY_THRESHOLD:
             events.extend(self._send_to_charging(rid))
         return events
@@ -518,7 +562,7 @@ class HeadlessFactoryRuntime:
         distance = math.hypot(dx, dy)
         max_step = (self.config.linear_speed
                     * float(np.clip(state.get("speed_scale", 1.0), 0.0, 1.0))
-                    * self.config.timestep_seconds)
+                    * self._tick_seconds)
         if distance <= max(self.config.waypoint_tolerance, max_step):
             # The real controller reports a waypoint reached while physically
             # inside its tolerance; it does not teleport to the coordinate.
@@ -535,9 +579,19 @@ class HeadlessFactoryRuntime:
         state["total_distance"] = float(
             state.get("total_distance", 0.0)) + moved
         self.telemetry["distance_travelled"] += moved
+        events = []
+        task = state.get("current_task")
+        if task is not None and moved > 0 and task.ideal_distance is not None:
+            task.actual_distance += moved
+            excess = max(0.0, task.actual_distance - task.ideal_distance)
+            delta = excess - task.excess_distance_cursor
+            if delta < -1e-9:
+                raise ValueError("task excess distance cursor moved backwards")
+            if delta > 0:
+                task.excess_distance_cursor = excess
         if self._waypoint_index[rid] >= len(waypoints):
-            return self._handle_goal_reached(rid)
-        return []
+            events.extend(self._handle_goal_reached(rid))
+        return events
 
     def _retry_routes(self) -> List[dict]:
         events = []
@@ -609,8 +663,14 @@ class HeadlessFactoryRuntime:
         return events
 
     def tick(self) -> List[dict]:
-        """Advance exactly one Webots basic timestep."""
-        self.current_time += self.config.timestep_seconds
+        """Advance by one Webots timestep, capped exactly at the horizon."""
+        if self._horizon_finalized:
+            return []
+        remaining = self.config.episode_end_time - self.current_time
+        if remaining <= 1e-9:
+            return self._finalize_horizon()
+        self._tick_seconds = min(self.config.timestep_seconds, remaining)
+        self.current_time += self._tick_seconds
         self.telemetry["ticks"] += 1
         self.coordinator.set_sim_time(self.current_time)
         self._expire_failed_pairs()
@@ -633,24 +693,52 @@ class HeadlessFactoryRuntime:
             task.task_id for task in self.tasks
             if task.status == TaskStatus.PENDING
             and float(task.arrival_time) <= self.current_time + 1e-9
+            and float(task.arrival_time) < self.config.episode_end_time
         }
         for task_id in sorted(arrived - self._visible_task_ids):
             events.append({"type": "task_arrived", "task_id": task_id})
         self._visible_task_ids.update(arrived)
+        for task in self.tasks:
+            events.extend(task.deadline_events(self.current_time))
+        if self.current_time + 1e-9 >= self.config.episode_end_time:
+            events.extend(self._finalize_horizon())
+        return events
+
+    def _finalize_horizon(self) -> List[dict]:
+        """Settle deadline state at H once, without draining the factory."""
+        if self._horizon_finalized:
+            return []
+        self.current_time = self.config.episode_end_time
+        events = []
+        for task in self.tasks:
+            if task.arrival_time < self.config.episode_end_time:
+                events.extend(task.deadline_events(
+                    self.current_time,
+                    horizon_seconds=self.config.episode_end_time,
+                    final=True))
+        self._horizon_finalized = True
+        events.append({
+            "type": "episode_horizon",
+            "current_time": float(self.current_time),
+        })
         return events
 
     def advance_until_event(self, *, max_seconds: Optional[float] = None
                             ) -> List[dict]:
         """Advance until a policy-relevant event or a bounded stall."""
+        if self.is_terminal():
+            return []
         limit = (self.config.max_advance_seconds if max_seconds is None
                  else float(max_seconds))
         if not math.isfinite(limit) or limit <= 0:
             raise ValueError("max_seconds must be finite and positive")
-        deadline = self.current_time + limit
+        deadline = min(
+            self.current_time + limit, self.config.episode_end_time)
         relevant = {
             "task_arrived", "task_completed", "task_failed_battery",
             "charge_swap_completed", "assignment_rejected",
-            "deadlock_replan", "robot_idle",
+            "deadlock_replan", "robot_idle", "task_deadline_base",
+            "task_deadline_severity", "episode_horizon",
         }
         collected = []
         while self.current_time + 1e-9 < deadline:
@@ -660,7 +748,9 @@ class HeadlessFactoryRuntime:
                 break
             if self.is_terminal():
                 break
-            if not self.has_active_execution() and not self.has_future_arrivals():
+            if (not self.config.fixed_horizon
+                    and not self.has_active_execution()
+                    and not self.has_future_arrivals()):
                 break
         if self.current_time + 1e-9 >= deadline and not collected:
             collected.append({"type": "advance_timeout"})
@@ -673,5 +763,11 @@ class HeadlessFactoryRuntime:
             "completed_ids": sorted(self._completed_ids),
             "failed_pairs": sorted(list(self.context.failed_pairs)),
             "dynamics_version": HEADLESS_DYNAMICS_VERSION,
+            "episode_end_time": self.config.episode_end_time,
+            "fixed_horizon": self.config.fixed_horizon,
+            "horizon_finalized": self._horizon_finalized,
+            "termination_reason": (
+                "episode_horizon" if self._horizon_finalized else
+                "idle" if self.is_terminal() else None),
         })
         return result

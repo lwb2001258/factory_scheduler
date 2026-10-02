@@ -16,6 +16,7 @@ from schedulers import (
     validate_assignments,
 )
 from task_generator import TransportTask
+from dual_objective import CountRewardProfile, UtilityV2RewardProfile
 
 
 ENVIRONMENT_VERSION = RL_ENVIRONMENT_VERSION
@@ -66,17 +67,32 @@ class SchedulingEnvironment:
 
     def __init__(self, config: Optional[RLEnvironmentConfig] = None,
                  reward: Optional[RewardConfig] = None,
+                 reward_profile=None,
                  simulation_mode: str = "headless",
                  runtime_config: Optional[HeadlessRuntimeConfig] = None):
         if simulation_mode not in {"abstract", "headless", "webots"}:
             raise ValueError(
                 "simulation_mode must be abstract, headless or webots")
+        if reward is not None and reward_profile is not None:
+            raise ValueError("legacy reward and reward_profile are exclusive")
+        if (reward_profile is not None and not isinstance(
+                reward_profile, (CountRewardProfile,
+                                 UtilityV2RewardProfile))):
+            raise ValueError("unsupported reward profile")
         self.config = config or RLEnvironmentConfig()
         self.reward_config = reward or RewardConfig()
+        self.reward_profile = reward_profile
         self.requested_simulation_mode = simulation_mode
         self.simulation_mode = (
             "headless" if simulation_mode == "abstract" else simulation_mode)
         self.runtime_config = runtime_config or HeadlessRuntimeConfig()
+        if (self.reward_profile is not None and
+                not self.runtime_config.fixed_horizon):
+            raise ValueError("versioned reward profiles require fixed_horizon")
+        if (self.reward_profile is not None and
+                self.reward_profile.horizon_seconds
+                != self.runtime_config.episode_end_time):
+            raise ValueError("reward profile horizon differs from runtime")
         self.action_dim = self.config.max_robots * self.config.max_tasks + 1
         self.no_op_action = self.action_dim - 1
         self.observation_dim = (
@@ -94,6 +110,7 @@ class SchedulingEnvironment:
         self._completed_ids = set()
         self._cost_matrix = None
         self._runtime: Optional[HeadlessFactoryRuntime] = None
+        self._reward_totals = {}
         self.rng = np.random.default_rng(0)
 
     def reset(self, robot_states: Optional[Dict[int, dict]] = None,
@@ -117,6 +134,7 @@ class SchedulingEnvironment:
             bind(self._robots)
         self._step = 0
         self._completed_ids.clear()
+        self._reward_totals = {}
         self._cost_matrix = None
         if self.simulation_mode == "headless":
             self._runtime = HeadlessFactoryRuntime(
@@ -130,6 +148,12 @@ class SchedulingEnvironment:
         return self.observe(), {
             "environment_version": ENVIRONMENT_VERSION,
             "simulation_mode": self.simulation_mode,
+            "reward_profile_version": (
+                self.reward_profile.version if self.reward_profile is not None
+                else "legacy_reward"),
+            "reward_profile_hash": (
+                self.reward_profile.sha256
+                if self.reward_profile is not None else None),
             "dynamics_version": (
                 HEADLESS_DYNAMICS_VERSION
                 if self.simulation_mode == "headless" else "webots-live"),
@@ -317,15 +341,68 @@ class SchedulingEnvironment:
             raise ValueError("invalid RL observation")
         return result
 
-    def step(self, action: int):
+    def _profile_reward(self, events, *, dispatch_task=None,
+                        invalid_action=False, defer=False):
+        if self.reward_profile is None:
+            return None
+        components = self.reward_profile.transition(
+            self._tasks, events, dispatch_task=dispatch_task,
+            invalid_action=invalid_action, defer=defer,
+            horizon_seconds=self.runtime_config.episode_end_time,
+            runtime_mode="headless_webots_logic")
+        for name, value in components.items():
+            if name.startswith("reward_") and name not in {
+                    "reward_profile_version", "reward_profile_hash"}:
+                if isinstance(value, (int, float)):
+                    self._reward_totals[name] = (
+                        self._reward_totals.get(name, 0.0) + float(value))
+        return components
+
+    def _truncation_info(self, truncated: bool) -> dict:
+        invalid = bool(
+            truncated and self._runtime is not None
+            and self._runtime.current_time + 1e-9
+            < self.runtime_config.episode_end_time)
+        return {
+            "invalid_truncation": invalid,
+            "truncation_reason": (
+                "max_steps_before_horizon" if invalid else None),
+        }
+
+    def step(self, action: int, *, candidate_attribution: bool = True):
         if self.simulation_mode != "headless" or self._runtime is None:
             raise RuntimeError("step is only available in headless mode")
+        if not isinstance(candidate_attribution, bool):
+            raise ValueError("candidate_attribution must be boolean")
+        action_has_valid_type = (
+            not isinstance(action, bool) and
+            isinstance(action, (int, np.integer)))
+        if action_has_valid_type:
+            action = int(action)
         mask = self.get_action_mask()
         self._step += 1
-        if not (0 <= action < self.action_dim) or not mask[action]:
-            return self.observe(), self.reward_config.invalid_action, False, (
-                self._step >= self.config.max_steps_per_episode
-            ), {"invalid_action": True,
+        if (action_has_valid_type and self.reward_profile is not None
+                and action == self.no_op_action
+                and not mask[action]):
+            components = self._profile_reward([], defer=True)
+            truncated = self._step >= self.config.max_steps_per_episode
+            return self.observe(), components["reward_total"], False, truncated, {
+                "no_op": True,
+                "deferred_feasible_assignment": True,
+                "reward_components": components,
+                **self._truncation_info(truncated),
+                "dynamics_version": HEADLESS_DYNAMICS_VERSION,
+            }
+        if (not action_has_valid_type or not (0 <= action < self.action_dim)
+                or not mask[action]):
+            truncated = self._step >= self.config.max_steps_per_episode
+            components = self._profile_reward([], invalid_action=True)
+            reward = (self.reward_config.invalid_action if components is None
+                      else components["reward_total"])
+            return self.observe(), reward, False, truncated, {
+                "invalid_action": True,
+                "reward_components": components,
+                **self._truncation_info(truncated),
                 "dynamics_version": HEADLESS_DYNAMICS_VERSION}
 
         distance_before = float(
@@ -339,28 +416,36 @@ class SchedulingEnvironment:
                 event.get("type") == "task_completed" for event in events)
             distance = (float(self._runtime.telemetry["distance_travelled"])
                         - distance_before)
-            reward = self._event_reward(events, distance)
-            if not events and not had_active and not had_future:
+            components = self._profile_reward(events)
+            reward = (self._event_reward(events, distance)
+                      if components is None else components["reward_total"])
+            if (components is None and not events and
+                    not had_active and not had_future):
                 reward += self.reward_config.no_op
-            return self.observe(), float(reward), self._is_terminal_state(), (
-                self._step >= self.config.max_steps_per_episode
-            ), {
+            truncated = self._step >= self.config.max_steps_per_episode
+            return self.observe(), float(reward), self._is_terminal_state(), truncated, {
                 "no_op": True,
                 "completed_this_step": completed,
                 "completed_count": len(self._completed_ids),
                 "runtime_events": events,
                 "distance_travelled": distance,
+                "reward_components": components,
+                **self._truncation_info(truncated),
                 "dynamics_version": HEADLESS_DYNAMICS_VERSION,
             }
 
         assignment = self.assignment_for_action(action)
         if assignment is None:
-            return self.observe(), self.reward_config.invalid_action, False, False, {
+            components = self._profile_reward([], invalid_action=True)
+            reward = (self.reward_config.invalid_action if components is None
+                      else components["reward_total"])
+            return self.observe(), reward, False, False, {
                 "invalid_action": True,
+                "reward_components": components,
                 "dynamics_version": HEADLESS_DYNAMICS_VERSION}
         task = assignment.task
         wait = max(0.0, self._context.current_time - task.arrival_time)
-        reward = (
+        legacy_reward = (
             self.reward_config.valid_assignment
             + self.reward_config.priority * max(0.0, float(task.priority))
             + self.reward_config.age_bonus * min(
@@ -374,15 +459,24 @@ class SchedulingEnvironment:
         events = [dispatch_event]
         self._sync_runtime()
         if dispatch_event.get("type") != "assignment_committed":
-            return self.observe(), self.reward_config.invalid_action, (
+            components = self._profile_reward(
+                events, invalid_action=True)
+            reward = (self.reward_config.invalid_action if components is None
+                      else components["reward_total"])
+            truncated = self._step >= self.config.max_steps_per_episode
+            return self.observe(), reward, (
                 self._is_terminal_state()), (
-                self._step >= self.config.max_steps_per_episode), {
+                truncated), {
                     "assignment_rejected": True,
                     "reason": dispatch_event.get("reason", "unknown"),
                     "runtime_events": events,
+                    "reward_components": components,
+                    **self._truncation_info(truncated),
                     "completed_count": len(self._completed_ids),
                     "dynamics_version": HEADLESS_DYNAMICS_VERSION,
                 }
+
+        task.candidate_reward_eligible = candidate_attribution
 
         # Assign all currently possible work before advancing physical time.
         if not self.get_action_mask()[:-1].any():
@@ -392,7 +486,11 @@ class SchedulingEnvironment:
             event.get("type") == "task_completed" for event in events)
         distance = (float(self._runtime.telemetry["distance_travelled"])
                     - distance_before)
-        reward += self._event_reward(events, distance)
+        components = self._profile_reward(
+            events, dispatch_task=task,
+            invalid_action=not candidate_attribution)
+        reward = (legacy_reward + self._event_reward(events, distance)
+                  if components is None else components["reward_total"])
         terminated = self._is_terminal_state()
         truncated = self._step >= self.config.max_steps_per_episode
         return self.observe(), float(reward), bool(terminated), bool(truncated), {
@@ -401,6 +499,8 @@ class SchedulingEnvironment:
             "completed_count": len(self._completed_ids),
             "runtime_events": events,
             "distance_travelled": distance,
+            "reward_components": components,
+            **self._truncation_info(truncated),
             "dynamics_version": HEADLESS_DYNAMICS_VERSION,
         }
 
@@ -457,6 +557,13 @@ class SchedulingEnvironment:
         result["runtime_mode"] = "headless_webots_logic"
         result["physics_fidelity"] = "business_logic_only"
         result["initialized"] = True
+        if self.reward_profile is not None:
+            result["reward_profile_version"] = self.reward_profile.version
+            result["reward_profile_hash"] = self.reward_profile.sha256
+            result["reward_totals"] = dict(self._reward_totals)
+        else:
+            result["reward_profile_version"] = "legacy_reward"
+            result["reward_profile_hash"] = None
         return result
 
     def step_scheduler(self, scheduler):
@@ -503,7 +610,10 @@ class SchedulingEnvironment:
             return self._scheduler_rejection(
                 scheduler, reason, {})
 
-        transition = self.step(action)
+        diagnostics = dict(getattr(decision, "diagnostics", {}) or {})
+        transition = self.step(
+            action,
+            candidate_attribution=not bool(diagnostics.get("fallback", False)))
         info = dict(transition[4])
         if info.get("assignment_rejected") or info.get("invalid_action"):
             scheduler.on_assignment_rejected(
@@ -514,8 +624,7 @@ class SchedulingEnvironment:
             "scheduler_name": getattr(
                 decision, "algorithm_name", None) or
                 getattr(scheduler, "name", type(scheduler).__name__),
-            "scheduler_diagnostics": dict(
-                getattr(decision, "diagnostics", {}) or {}),
+            "scheduler_diagnostics": diagnostics,
             "scheduler_computation_time": float(
                 getattr(decision, "computation_time", 0.0)),
         })
@@ -524,12 +633,17 @@ class SchedulingEnvironment:
     def _scheduler_rejection(self, scheduler, reason: str, diagnostics: dict):
         self._step += 1
         name = getattr(scheduler, "name", type(scheduler).__name__)
-        return self.observe(), float(self.reward_config.invalid_action), False, (
-            self._step >= self.config.max_steps_per_episode), {
+        components = self._profile_reward([], invalid_action=True)
+        reward = (self.reward_config.invalid_action if components is None
+                  else components["reward_total"])
+        truncated = self._step >= self.config.max_steps_per_episode
+        return self.observe(), float(reward), False, truncated, {
                 "scheduler_output_rejected": True,
                 "reason": str(reason),
                 "scheduler_name": name,
                 "scheduler_diagnostics": dict(diagnostics or {}),
+                "reward_components": components,
+                **self._truncation_info(truncated),
                 "completed_count": len(self._completed_ids),
                 "dynamics_version": HEADLESS_DYNAMICS_VERSION,
             }

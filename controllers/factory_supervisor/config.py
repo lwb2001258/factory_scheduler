@@ -147,6 +147,18 @@ PARKING_SPOTS = {
     8: ( 8.5, -1.2),  # ROBOT_8 → near CS2, clear of south workstations
 }
 
+# Initial yaw values mirror the corresponding Robot rotations in the world.
+PARKING_HEADINGS = {
+    1: 0.0,
+    2: 0.0,
+    3: 3.14159,
+    4: 3.14159,
+    5: 1.5708,
+    6: -1.5708,
+    7: 0.0,
+    8: 3.14159,
+}
+
 # ----------------------------------------------------------------
 # REST_NODES — corridor / aisle nodes where IDLE robots park
 # while waiting for the next task.

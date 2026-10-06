@@ -969,8 +969,11 @@ class MetricsCollector:
         }
     
     def save_results(self, robots: dict, task_stats: dict,
-                     coord_stats: dict, total_time: float):
+                     coord_stats: dict, total_time: float,
+                     extra_results: Optional[dict] = None):
         """Save all results to JSON file."""
+        if extra_results is not None and not isinstance(extra_results, dict):
+            raise ValueError("extra_results must be a mapping or null")
         final_metrics = self.compute_final_metrics(
             robots, task_stats, coord_stats, total_time
         )
@@ -1031,9 +1034,28 @@ class MetricsCollector:
             "safety_events": self.safety_events,
             "time_series": [asdict(sr) for sr in self.step_records[-100:]],  # last 100 steps
         }
-        
-        with open(self.output_path, 'w') as f:
-            json.dump(results, f, indent=2, default=str, allow_nan=False)
+        if extra_results:
+            overlap = set(results).intersection(extra_results)
+            if overlap:
+                raise ValueError(
+                    f"extra_results cannot replace core fields: {overlap}")
+            results.update(extra_results)
+
+        # A killed process must never leave a truncated JSON file that a
+        # resume pass mistakes for a completed 1800-second episode.
+        temporary_path = self.output_path + ".tmp"
+        try:
+            with open(temporary_path, 'w', encoding='utf-8') as f:
+                json.dump(
+                    results, f, indent=2, default=str, allow_nan=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, self.output_path)
+        finally:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
         
         return self.output_path
     

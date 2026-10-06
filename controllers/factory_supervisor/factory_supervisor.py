@@ -22,6 +22,7 @@ import struct
 import inspect
 import itertools
 import time as real_time
+from dataclasses import fields, replace
 from typing import Dict, List, Optional, Tuple
 
 # Webots controller API
@@ -78,6 +79,21 @@ from startup_gate import StartupGate
 from metrics_collector import MetricsCollector, SafetyEvent
 from joint_plan_transaction import JointPlanTransaction
 from training_scenarios import formal_scenario_config
+from dual_objective import (
+    UtilityScoreConfig, UtilityV2RewardProfile, count_evaluation,
+    utility_v2_evaluation,
+)
+
+
+# These outcomes mean that no policy action can be committed at this tick.
+# They are normal wait states, not invalid scheduler output.  In particular,
+# ``pair_temporarily_blocked`` is emitted during ASSIGNMENT_FAILURE_TTL after a
+# physical route/command rejection and must be allowed to expire without
+# contaminating an on-policy rollout with a fallback assignment.
+SCHEDULER_WAIT_REASONS = frozenset({
+    "no_candidates", "no_feasible_pair", "empty_assignment",
+    "empty_assignments", "pair_temporarily_blocked",
+})
 
 
 def _validate_runtime_task_manifest(document, *, scenario: str, seed: int,
@@ -2413,6 +2429,31 @@ class FactorySupervisor:
         # controller/visibility workaround.
         self._apply_scenario_robot_count()
         self._init_robots()
+        self._physical_collision_last_seen: Dict[Tuple[int, int], float] = {}
+        self._physical_collision_rearm_seconds = 1.0
+        self._robot_id_by_webots_node_id = {}
+        self._physical_collision_api_available = bool(self.robot_nodes)
+        for robot_id, node in self.robot_nodes.items():
+            if (not hasattr(node, "getId") or
+                    not hasattr(node, "getContactPoints")):
+                self._physical_collision_api_available = False
+                continue
+            try:
+                self._robot_id_by_webots_node_id[int(node.getId())] = robot_id
+            except Exception:
+                self._physical_collision_api_available = False
+        if (len(self._robot_id_by_webots_node_id) != self.num_robots):
+            self._physical_collision_api_available = False
+        self.metrics.physical_collision_observable = (
+            self._physical_collision_api_available)
+        self._physical_rollout_steps = []
+        self._physical_fine_tune_enabled = any(os.environ.get(
+            name, "0").strip().lower() in {"1", "true", "yes", "on"}
+            for name in (
+                "SMART_FACTORY_PHYSICAL_FINE_TUNE",
+                "SMART_FACTORY_GRAPH_PPO_FINE_TUNE"))
+        (self._utility_score_config,
+         self._utility_reward_profile) = self._load_utility_contracts()
         
         # Set up communication
         self._init_communication()
@@ -2568,6 +2609,211 @@ class FactorySupervisor:
                         self.robots[rid].heading = rot[3] if rot[2] >= 0 else -rot[3]
             except Exception:
                 pass  # Keep last-known position on read failure
+
+    def _scan_physical_robot_collisions(self):
+        """Count rigid-body robot/robot contact episodes from Webots.
+
+        Contact may be reported by both robot roots and on many consecutive
+        physics ticks.  Canonical pairs plus a one-second no-contact rearm
+        window turn those samples into collision episodes.
+        """
+        if not self._physical_collision_api_available:
+            return
+        observed = set()
+        try:
+            for robot_id, node in self.robot_nodes.items():
+                for contact in node.getContactPoints(False):
+                    peer_node_id = int(getattr(contact, "node_id"))
+                    peer_id = self._robot_id_by_webots_node_id.get(
+                        peer_node_id)
+                    if peer_id is not None and peer_id != robot_id:
+                        observed.add(tuple(sorted((robot_id, peer_id))))
+        except Exception as exc:
+            # A formal run must fail instead of claiming zero observed
+            # collisions after losing the underlying Webots telemetry.
+            raise RuntimeError(
+                "Webots physical contact observation failed") from exc
+        for pair in observed:
+            last_seen = self._physical_collision_last_seen.get(pair)
+            if (last_seen is None or
+                    self.sim_time - last_seen >
+                    self._physical_collision_rearm_seconds):
+                self.metrics.record_physical_collision()
+            self._physical_collision_last_seen[pair] = self.sim_time
+
+    def _load_utility_contracts(self):
+        """Load explicitly registered Utility V2 scoring/reward contracts."""
+        source = os.environ.get(
+            "SMART_FACTORY_UTILITY_SCORE_CONFIG_PATH", "").strip()
+        if not source:
+            return None, None
+        with open(source, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        values = document.get("utility_score_config", document)
+        if not isinstance(values, dict):
+            raise ValueError("utility score config document is invalid")
+        config = UtilityScoreConfig(**values)
+        if not math.isclose(
+                config.horizon_seconds, float(SIM_DURATION),
+                rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(
+                "utility score horizon differs from Webots duration")
+        reward_values = document.get("utility_reward_profile")
+        reward_profile = None
+        if reward_values is not None:
+            if not isinstance(reward_values, dict):
+                raise ValueError("utility reward profile is invalid")
+            allowed = {
+                field.name for field in fields(UtilityV2RewardProfile)}
+            reward_profile = UtilityV2RewardProfile(**{
+                key: value for key, value in reward_values.items()
+                if key in allowed})
+            reward_profile = replace(
+                reward_profile, safety_observation="webots_physical")
+            if not math.isclose(
+                    reward_profile.horizon_seconds, float(SIM_DURATION),
+                    rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError(
+                    "utility reward horizon differs from Webots duration")
+        return config, reward_profile
+
+    def _record_committed_physical_rollout(self, decision, assignment):
+        """Retain one on-policy action only after physical dispatch commit."""
+        if not self._physical_fine_tune_enabled:
+            return
+        diagnostics = decision.diagnostics
+        step = diagnostics.get("physical_rollout_step")
+        if (diagnostics.get("fallback", False) or
+                not diagnostics.get("physical_fine_tune", False) or
+                not isinstance(step, dict)):
+            raise RuntimeError(
+                "physical fine tune committed a non-policy assignment")
+        if (step.get("selected_robot_id") != assignment.robot_id or
+                step.get("selected_task_id") != assignment.task.task_id):
+            raise RuntimeError("physical rollout action differs from commit")
+        row = dict(step)
+        row.update({
+            "reward": 0.0,
+            "done": False,
+            "committed_at": float(self.sim_time),
+            "robot_id": int(assignment.robot_id),
+            "task_id": int(assignment.task.task_id),
+        })
+        self._physical_rollout_steps.append(row)
+
+    def _formal_episode_results(self):
+        """Compute Count and Utility V2 from the live physical task state."""
+        if self._utility_score_config is None:
+            return {}
+        tasks = list(self.task_generator.tasks_generated)
+        route_distances = {}
+        for task in tasks:
+            if task.assignment_time is None:
+                continue
+            if task.ideal_distance is None:
+                raise RuntimeError(
+                    f"task {task.task_id} has no physical ideal distance")
+            route_distances[task.task_id] = {
+                "ideal_distance": float(task.ideal_distance),
+                "actual_distance": float(task.actual_distance),
+            }
+        count_score = count_evaluation(
+            tasks, horizon_seconds=float(SIM_DURATION))
+        utility_score = utility_v2_evaluation(
+            tasks, self._utility_score_config,
+            route_distances=route_distances)
+        result = {
+            "count_evaluation": count_score,
+            "utility_v2_evaluation": utility_score,
+        }
+        if self._physical_fine_tune_enabled:
+            objective = os.environ.get(
+                "SMART_FACTORY_FINE_TUNE_OBJECTIVE", "").strip()
+            if objective not in {"count", "utility_v2"}:
+                raise RuntimeError(
+                    "physical fine tune objective must be count or utility_v2")
+            if not self._physical_rollout_steps:
+                raise RuntimeError(
+                    "physical fine tune episode has no committed policy steps")
+            if objective == "count":
+                reward = float(count_score["total_tasks_completed"])
+                reward_audit = {
+                    "reward_profile_version": "count_reward_v1",
+                    "reward_total": reward,
+                }
+            else:
+                if self._utility_reward_profile is None:
+                    raise RuntimeError(
+                        "utility fine tune requires a reward profile")
+                profile = self._utility_reward_profile
+                reward_rows = []
+                # With gamma=1, accumulating these physical facts at the
+                # terminal boundary is return-equivalent to online emission
+                # and avoids changing controller timing during Webots runs.
+                for task in tasks:
+                    if task.assignment_time is not None:
+                        reward_rows.append(profile.transition(
+                            tasks, [], dispatch_task=task,
+                            horizon_seconds=float(SIM_DURATION),
+                            runtime_mode="webots"))
+                terminal_events = []
+                for task in tasks:
+                    if task.status == TaskStatus.COMPLETED:
+                        terminal_events.append({
+                            "type": "task_completed",
+                            "task_id": int(task.task_id),
+                        })
+                    terminal_events.extend(task.deadline_events(
+                        self.sim_time,
+                        horizon_seconds=float(SIM_DURATION), final=True))
+                    if task.ideal_distance is not None:
+                        task.excess_distance_cursor = max(
+                            0.0, task.actual_distance - task.ideal_distance)
+                terminal_events.extend(
+                    {"type": "physical_collision"}
+                    for _ in range(self.metrics.physical_collision_count))
+                terminal_events.append({
+                    "type": "episode_horizon",
+                    "current_time": float(SIM_DURATION),
+                })
+                reward_rows.append(profile.transition(
+                    tasks, terminal_events,
+                    horizon_seconds=float(SIM_DURATION),
+                    runtime_mode="webots"))
+                reward = float(sum(
+                    row["reward_total"] for row in reward_rows))
+                component_names = (
+                    "reward_dispatch", "reward_completion",
+                    "reward_terminal_loss", "reward_route_excess",
+                    "reward_deadline_base", "reward_deadline_severity",
+                    "reward_invalid", "reward_defer", "reward_collision",
+                    "reward_proximity")
+                reward_audit = {
+                    "reward_profile_version": profile.version,
+                    "reward_profile_hash": profile.sha256,
+                    **{
+                        name: sum(
+                            float(row[name]) for row in reward_rows
+                            if row[name] is not None)
+                        for name in component_names
+                    },
+                    "reward_total": reward,
+                }
+            rollout = [dict(step) for step in self._physical_rollout_steps]
+            rollout[-1]["reward"] = reward
+            rollout[-1]["done"] = True
+            result["physical_fine_tune"] = {
+                "status": "complete",
+                "algorithm": os.environ.get(
+                    "SMART_FACTORY_FINE_TUNE_ALGORITHM",
+                    getattr(self.scheduler, "name", "unknown")),
+                "objective": objective,
+                "episode_return": reward,
+                "reward_audit": reward_audit,
+                "rollout_step_count": len(rollout),
+                "rollout": rollout,
+            }
+        return result
 
     def _send_command_to_robot(self, robot_id: int, command: dict):
         """Send a navigation command to a specific robot via Emitter."""
@@ -5423,6 +5669,9 @@ class FactorySupervisor:
                 dz = robot.position[1] - robot.last_position[1]
                 dist = math.sqrt(dx*dx + dz*dz)
                 robot.total_distance += dist
+                if (robot.current_task is not None and
+                        robot.current_task.ideal_distance is not None):
+                    robot.current_task.actual_distance += dist
             robot.last_position = robot.position
             if dt > 0:
                 robot.velocity = (dx / dt, dz / dt)
@@ -6199,10 +6448,16 @@ class FactorySupervisor:
                 self.metrics.record_scheduler_fallback(invalid_output=False)
             if not decision.is_feasible or not decision.assignments:
                 reason = decision.diagnostics.get("reason", "")
+                if self._physical_fine_tune_enabled:
+                    if reason in SCHEDULER_WAIT_REASONS:
+                        # GraphPPO's physical action space has no no-op edge.
+                        # Waiting keeps collection on-policy; a deterministic
+                        # fallback assignment would contaminate the rollout.
+                        break
+                    raise RuntimeError(
+                        "physical fine tune policy failed: " + str(reason))
                 self.metrics.record_scheduler_fallback(
-                    invalid_output=reason not in {
-                        "no_candidates", "no_feasible_pair",
-                        "empty_assignment", "empty_assignments"})
+                    invalid_output=reason not in SCHEDULER_WAIT_REASONS)
                 print(f"[T={self.sim_time:.1f}] Scheduler {self.scheduler.name} "
                       f"rejected: {decision.diagnostics.get('reason')}; "
                       "trying safe fallback chain")
@@ -6281,7 +6536,21 @@ class FactorySupervisor:
                     print(f"[T={self.sim_time:.1f}] Rolled back task "
                           f"{task.task_id}/robot {robot_id}: command send failed")
                     continue
+                # The runtime path oracle is the same static Grid-A* contract
+                # used by headless Utility V2.  Measured Webots displacement
+                # is accumulated in _update_robot_states for the denominator.
+                ideal_distance = float(
+                    context.path_cost_provider(robot_id, task))
+                if not math.isfinite(ideal_distance) or ideal_distance < 0:
+                    raise RuntimeError(
+                        "committed task has invalid ideal route distance")
+                task.ideal_distance = ideal_distance
+                task.actual_distance = 0.0
+                task.excess_distance_cursor = 0.0
+                task.rewarded_excess_distance_cursor = 0.0
                 active_scheduler.on_assignment_committed(assignment)
+                self._record_committed_physical_rollout(
+                    decision, assignment)
                 attach_learning_trace(
                     task, assignment, robot_states, pending, context,
                     decision.algorithm_name or active_scheduler.name)
@@ -6392,6 +6661,7 @@ class FactorySupervisor:
             
             # 1. Get robot positions from Webots
             self._get_robot_positions_from_webots()
+            self._scan_physical_robot_collisions()
             
             # 1.5 Broadcast all robot positions for peer conflict avoidance
             # EVERY STEP �?peer avoidance is safety-critical, no delays allowed.
@@ -6680,8 +6950,12 @@ class FactorySupervisor:
                   f"idle={idle_pct:.1f}%, battery={robot.battery:.1f}%")
         
         # Save detailed results
+        formal_results = self._formal_episode_results()
         self.metrics.save_results(
-            self.robots, task_stats, coord_stats, self.sim_time
+            self.robots, task_stats, coord_stats, self.sim_time,
+            extra_results=(
+                {"formal_evaluation": formal_results}
+                if formal_results else None),
         )
         
         print(f"\nResults saved to: {self.metrics.output_path}")

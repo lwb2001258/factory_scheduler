@@ -1,6 +1,7 @@
 """LinUCB meta-scheduler over existing deterministic assignment policies."""
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
@@ -291,6 +292,22 @@ class LinUCBScheduler(BaseScheduler):
                     for name, score in zip(self.model.arms, scores)},
                 "bandit_context_version": LINUCB_CONTEXT_VERSION,
             })
+            if (os.environ.get(
+                    "SMART_FACTORY_PHYSICAL_FINE_TUNE", "0"
+                    ).strip().lower() in {"1", "true", "yes", "on"} and
+                    result.is_feasible and result.assignments):
+                assignment = result.assignments[0]
+                result.diagnostics.update({
+                    "decoder": "physical_policy_action",
+                    "physical_fine_tune": True,
+                    "physical_rollout_step": {
+                        "kind": "linucb",
+                        "context": vector.tolist(),
+                        "arm": arm_name,
+                        "selected_robot_id": int(assignment.robot_id),
+                        "selected_task_id": int(assignment.task.task_id),
+                    },
+                })
             return result
         except Exception as exc:
             self._last_arm = None

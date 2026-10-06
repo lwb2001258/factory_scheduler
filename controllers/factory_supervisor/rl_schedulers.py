@@ -15,6 +15,12 @@ from schedulers import (
 from task_generator import TransportTask
 
 
+def _physical_fine_tune_enabled() -> bool:
+    return os.environ.get(
+        "SMART_FACTORY_PHYSICAL_FINE_TUNE", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class _AgentScheduler(BaseScheduler):
     def __init__(self, name: str, environment: SchedulingEnvironment):
         super().__init__(name)
@@ -48,19 +54,36 @@ class SarsaScheduler(_AgentScheduler):
             state = self.environment.set_snapshot(
                 robot_states, pending_tasks, context)
             mask = self.environment.get_action_mask()
+            discrete_state = self.agent.discretize(state)
+            physical_fine_tune = _physical_fine_tune_enabled()
             action = self.agent.select_action(
-                self.agent.discretize(state), mask, training=False)
+                discrete_state, mask, training=physical_fine_tune)
             assignment = self.environment.assignment_for_action(action)
             valid, reason = validate_assignment(
                 assignment, pending_tasks, robot_states, context)
         except Exception as exc:
             assignment, valid = None, False
             reason = f"sarsa_inference_error:{type(exc).__name__}"
+        diagnostics = {"reason": reason, "action": locals().get("action")}
+        if (locals().get("physical_fine_tune", False) and valid and
+                assignment is not None):
+            diagnostics.update({
+                "decoder": "physical_policy_action",
+                "physical_fine_tune": True,
+                "physical_rollout_step": {
+                    "kind": "sarsa",
+                    "state": state.tolist(),
+                    "action_mask": mask.astype(np.uint8).tolist(),
+                    "action": int(action),
+                    "selected_robot_id": int(assignment.robot_id),
+                    "selected_task_id": int(assignment.task.task_id),
+                },
+            })
         return SchedulerResult(
             [assignment] if valid and assignment else [],
             assignment.estimated_cost if assignment else None,
             time.perf_counter() - started, valid, self.name,
-            {"reason": reason, "action": locals().get("action")})
+            diagnostics)
 
 
 class DQNScheduler(_AgentScheduler):
@@ -83,18 +106,35 @@ class DQNScheduler(_AgentScheduler):
             state = self.environment.set_snapshot(
                 robot_states, pending_tasks, context)
             mask = self.environment.get_action_mask()
-            action = self.agent.select_action(state, mask, training=False)
+            physical_fine_tune = _physical_fine_tune_enabled()
+            action = self.agent.select_action(
+                state, mask, training=physical_fine_tune)
             assignment = self.environment.assignment_for_action(action)
             valid, reason = validate_assignment(
                 assignment, pending_tasks, robot_states, context)
         except Exception as exc:
             assignment, valid = None, False
             reason = f"dqn_inference_error:{type(exc).__name__}"
+        diagnostics = {"reason": reason, "action": locals().get("action")}
+        if (locals().get("physical_fine_tune", False) and valid and
+                assignment is not None):
+            diagnostics.update({
+                "decoder": "physical_policy_action",
+                "physical_fine_tune": True,
+                "physical_rollout_step": {
+                    "kind": "dqn",
+                    "state": state.tolist(),
+                    "action_mask": mask.astype(np.uint8).tolist(),
+                    "action": int(action),
+                    "selected_robot_id": int(assignment.robot_id),
+                    "selected_task_id": int(assignment.task.task_id),
+                },
+            })
         return SchedulerResult(
             [assignment] if valid and assignment else [],
             assignment.estimated_cost if assignment else None,
             time.perf_counter() - started, valid, self.name,
-            {"reason": reason, "action": locals().get("action")})
+            diagnostics)
 
 
 class PairwisePPOScheduler(_AgentScheduler):
@@ -115,6 +155,7 @@ class PairwisePPOScheduler(_AgentScheduler):
         self.network = PPONetwork(
             env.observation_dim, env.action_dim, hidden_size)
         self.network.load(model_path)
+        self.rng = np.random.default_rng(seed)
 
     @staticmethod
     def _masked(probabilities, mask):
@@ -138,21 +179,44 @@ class PairwisePPOScheduler(_AgentScheduler):
             state = self.environment.set_snapshot(
                 robot_states, pending_tasks, context)
             mask = self.environment.get_action_mask()
-            probabilities, _ = self.network.forward(state)
+            probabilities, value = self.network.forward(state)
             masked = self._masked(probabilities, mask)
-            action = int(np.argmax(masked))
+            physical_fine_tune = _physical_fine_tune_enabled()
+            action = int(
+                self.rng.choice(self.network.action_dim, p=masked)
+                if physical_fine_tune else np.argmax(masked))
+            old_log_probability = float(np.log(max(masked[action], 1e-12)))
             assignment = self.environment.assignment_for_action(action)
             valid, reason = validate_assignment(
                 assignment, pending_tasks, robot_states, context)
         except Exception as exc:
             assignment, valid = None, False
             reason = f"ppo_inference_error:{type(exc).__name__}"
+        diagnostics = {
+            "reason": reason, "action": locals().get("action"),
+            "pairwise_action": True,
+        }
+        if (locals().get("physical_fine_tune", False) and valid and
+                assignment is not None):
+            diagnostics.update({
+                "decoder": "physical_policy_action",
+                "physical_fine_tune": True,
+                "physical_rollout_step": {
+                    "kind": "pairwise_ppo",
+                    "state": state.tolist(),
+                    "action_mask": mask.astype(np.uint8).tolist(),
+                    "action": int(action),
+                    "old_log_probability": old_log_probability,
+                    "value": float(value),
+                    "selected_robot_id": int(assignment.robot_id),
+                    "selected_task_id": int(assignment.task.task_id),
+                },
+            })
         return SchedulerResult(
             [assignment] if valid and assignment else [],
             assignment.estimated_cost if assignment else None,
             time.perf_counter() - started, valid, self.name,
-            {"reason": reason, "action": locals().get("action"),
-             "pairwise_action": True})
+            diagnostics)
 
 
 class RLSchedulerSafetyWrapper(BaseScheduler):
@@ -174,6 +238,18 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
         self.fallback_decisions = 0
         self.timeout_count = 0
 
+    def _physical_fine_tune_enabled(self) -> bool:
+        enabled = any(os.environ.get(name, "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        } for name in (
+            "SMART_FACTORY_PHYSICAL_FINE_TUNE",
+            "SMART_FACTORY_GRAPH_PPO_FINE_TUNE",
+        ))
+        return bool(enabled and self.policy.name in {
+            "GraphPPO", "RainbowDQN", "QRDQN", "CQL", "LinUCB",
+            "PPO_RL", "SARSA", "DQN",
+        })
+
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
         result = self.assign(
             pending_tasks, robot_states,
@@ -186,7 +262,9 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
     def assign(self, pending_tasks: List[TransportTask], robot_states: dict,
                context: Optional[SchedulingContext] = None):
         context = context or SchedulingContext()
-        if self.consecutive_failures < self.max_consecutive_failures:
+        physical_fine_tune = self._physical_fine_tune_enabled()
+        if (physical_fine_tune or
+                self.consecutive_failures < self.max_consecutive_failures):
             result = self.policy.assign(pending_tasks, robot_states, context)
             timed_out = result.computation_time > self.timeout_seconds
             if result.is_feasible and result.assignments and not timed_out:
@@ -195,6 +273,27 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
                 self.policy_decisions += 1
                 result.diagnostics.update({
                     "fallback": False,
+                    "inference_ms": result.computation_time * 1000.0,
+                    "policy_decisions": self.policy_decisions,
+                    "fallback_decisions": self.fallback_decisions,
+                    "timeout_count": self.timeout_count,
+                    "timeout_limit_ms": self.timeout_seconds * 1000.0,
+                })
+                return result
+            if physical_fine_tune:
+                # An on-policy collection episode must never substitute a
+                # Hungarian action.  A legitimate empty action waits for the
+                # next physical dispatch opportunity; timeouts and policy
+                # errors are surfaced to the supervisor as hard failures.
+                reason = result.diagnostics.get(
+                    "reason", "invalid_rl_output")
+                if timed_out:
+                    reason = "inference_timeout"
+                    self.timeout_count += 1
+                result.diagnostics.update({
+                    "reason": reason,
+                    "fallback": False,
+                    "physical_fine_tune_rejected": True,
                     "inference_ms": result.computation_time * 1000.0,
                     "policy_decisions": self.policy_decisions,
                     "fallback_decisions": self.fallback_decisions,
@@ -237,7 +336,13 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
     def on_assignment_rejected(self, assignment, reason):
         target = self.policy if self._last_source == "policy" else self.fallback
         target.on_assignment_rejected(assignment, reason)
-        self.consecutive_failures += 1
+        # A Webots route/command rejection is a physical commit failure, not
+        # a GraphPPO inference failure.  It must not activate a Hungarian
+        # fallback during an on-policy collection episode.
+        if self._physical_fine_tune_enabled():
+            self.consecutive_failures = 0
+        else:
+            self.consecutive_failures += 1
 
     def reset(self):
         super().reset()

@@ -1,6 +1,13 @@
-"""Graph-PPO task assignment with Hungarian deployment decoding."""
+"""Graph-PPO task assignment with Hungarian deployment decoding.
+
+Physical fine tuning is opt-in.  Normal deployment remains deterministic and
+uses the Hungarian decoder; a Webots collection run samples one feasible edge
+and emits the complete on-policy observation in scheduler diagnostics.  The
+supervisor persists that observation only after the physical dispatch commits.
+"""
 
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Iterable, Optional
@@ -338,6 +345,35 @@ class GraphPPOScheduler(BaseScheduler):
                 return _result_from_matching(
                     self.name, matrix, [], pending_tasks, robot_states,
                     context, started, {"model": GRAPH_PPO_ALGORITHM})
+            physical_fine_tune = any(os.environ.get(
+                name, "0").strip().lower() in {"1", "true", "yes", "on"}
+                for name in (
+                    "SMART_FACTORY_PHYSICAL_FINE_TUNE",
+                    "SMART_FACTORY_GRAPH_PPO_FINE_TUNE"))
+            if physical_fine_tune:
+                edge_index, old_log_probability, value = (
+                    self.model.sample_edge(features))
+                row, column = coordinates[edge_index]
+                pairs = [(int(row), int(column))]
+                return _result_from_matching(
+                    self.name, matrix, pairs, pending_tasks, robot_states,
+                    context, started, {
+                        "model": GRAPH_PPO_ALGORITHM,
+                        "decoder": "on_policy_sample",
+                        "physical_fine_tune": True,
+                        "physical_rollout_step": {
+                            "kind": "graph_ppo",
+                            "features": features.tolist(),
+                            "action_index": int(edge_index),
+                            "old_log_probability": float(
+                                old_log_probability),
+                            "value": float(value),
+                            "selected_robot_id": int(
+                                matrix.robot_ids[int(row)]),
+                            "selected_task_id": int(
+                                matrix.tasks[int(column)].task_id),
+                        },
+                    })
             probabilities, _, _ = self.model.edge_policy(features)
             ranking = np.full(matrix.values.shape, np.inf, dtype=np.float64)
             for index, (row, column) in enumerate(coordinates):

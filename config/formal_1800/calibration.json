@@ -1,0 +1,70 @@
+{
+  "utility_reward_profile": {
+    "age_scale_seconds": 120.0,
+    "b_age": 0.5,
+    "b_collision": 100.0,
+    "b_complete": 10.0,
+    "b_defer": 2.0,
+    "b_invalid": 5.0,
+    "b_priority": 0.5,
+    "b_proximity": 20.0,
+    "b_unfinished": 10.0,
+    "b_valid": 0.5,
+    "execution_cap_seconds": 300.0,
+    "gamma": 1.0,
+    "horizon_seconds": 1800.0,
+    "lambda_deadline": 1.0,
+    "lambda_excess_distance": 0.08,
+    "lambda_execution": 0.01,
+    "lambda_unfinished_age": 0.03,
+    "lambda_wait": 0.03,
+    "max_age_bonus_units": 2.0,
+    "objective": "utility_v2",
+    "priority_weights": {
+      "1": 1.0,
+      "2": 2.0,
+      "3": 4.0
+    },
+    "proximity_enabled": false,
+    "return_normalization": null,
+    "reward_clipping": null,
+    "safety_episode_rearm_seconds": 1.0,
+    "safety_observation": "unobserved",
+    "unfinished_age_cap_seconds": 300.0,
+    "version": "utility_reward_v2_initial",
+    "wait_cap_seconds": 300.0
+  },
+  "utility_reward_profile_sha256": "9918c4cc95653706e26dda78ccfcb02ec6cec2e8e5db95915121970a63cfebdd",
+  "utility_score_config": {
+    "component_weights": {
+      "priority_completion": 0.5,
+      "queue_extra": 0.1,
+      "route_efficiency": 0.1,
+      "timeliness": 0.3
+    },
+    "deadline_seconds": {
+      "1": null,
+      "2": 425,
+      "3": 275
+    },
+    "horizon_seconds": 1800.0,
+    "kappa_by_priority": {
+      "1": 50.0,
+      "2": 100.0,
+      "3": 150.0
+    },
+    "max_deadline_penalty_points": 15.0,
+    "priority_weights": {
+      "1": 1.0,
+      "2": 2.0,
+      "3": 4.0
+    },
+    "tau_by_priority": {
+      "1": 100.0,
+      "2": 200.0,
+      "3": 300.0
+    },
+    "version": "utility_deadline_v2_horizon_adjusted"
+  },
+  "utility_score_config_sha256": "461e9a3ac41c0d65a3774f913d350eea7ba2722b5a11c373a5e729abac0dbfbe"
+}

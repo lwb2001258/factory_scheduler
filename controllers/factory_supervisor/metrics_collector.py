@@ -147,13 +147,30 @@ class MetricsCollector:
         self.scheduler_timeout_count = 0
         self.invalid_scheduler_outputs = 0
         self.scheduler_fallbacks = 0
+        self.scheduler_fallback_reasons: Dict[str, int] = {}
+        self.scheduler_failure_reasons: Dict[str, int] = {}
         self.native_scheduler_commits = 0
         self.fallback_scheduler_commits = 0
         self.commits_by_algorithm: Dict[str, int] = {}
+        self.solver_joint_solution_count = 0
+        self.solver_proposed_pair_count = 0
+        self.solver_unattempted_pair_count = 0
+        self.solver_joint_objective_sum = 0.0
+        self.solver_joint_objective_observations = 0
+        self.first_assignment_attempt_count = 0
+        self.first_assignment_commit_count = 0
+        self.first_assignment_rejection_count = 0
+        self.first_assignment_estimated_cost_sum = 0.0
+        self.first_assignment_cost_observations = 0
+        self.solver_execution_by_algorithm: Dict[str, dict] = {}
         self.rl_inference_latencies_ms: List[float] = []
         self.rl_timeout_count = 0
         self.rl_policy_decisions = 0
         self.rl_fallback_decisions = 0
+        self.rl_cooldown_count = 0
+        self.rl_retry_count = 0
+        self.rl_cooldown_remaining = 0
+        self.rl_max_cooldown_remaining = 0
         self.physical_collision_count = 0
         self.robot_exposure: Dict[int, dict] = {}
         self.expected_task_manifest_sha256 = None
@@ -233,10 +250,45 @@ class MetricsCollector:
             raise ValueError("task busy time cannot exceed available time")
         self.robot_exposure[robot_id] = canonical
 
-    def record_scheduler_fallback(self, invalid_output: bool = True):
+    @staticmethod
+    def normalize_scheduler_failure_reason(reason: object) -> str:
+        """Map runtime-specific reason codes to a bounded audit taxonomy."""
+        raw = str(reason or "unspecified").strip().lower()
+        if "timeout" in raw:
+            return "timeout"
+        if "cooldown" in raw or "temporarily_disabled" in raw:
+            return "cooldown"
+        if raw in {
+                "no_candidates", "no_candidate", "no_feasible_pair",
+                "empty_assignment", "empty_assignments", "no_assignment"}:
+            return "empty_candidate"
+        if raw in {
+                "command_send_failed", "pickup_path_unreachable",
+                "physical_commit_failed", "route_commit_failed"}:
+            return "physical_commit_failure"
+        if "model" in raw or raw in {
+                "policy_exception", "inference_exception"}:
+            return "model_exception"
+        if "exception" in raw:
+            return "scheduler_exception"
+        if raw in {"invalid_rl_output", "invalid_output", "invalid_action"}:
+            return "invalid_output"
+        return "unspecified"
+
+    def record_scheduler_failure(self, reason: object) -> str:
+        category = self.normalize_scheduler_failure_reason(reason)
+        self.scheduler_failure_reasons[category] = (
+            self.scheduler_failure_reasons.get(category, 0) + 1)
+        return category
+
+    def record_scheduler_fallback(self, invalid_output: bool = True,
+                                  reason: object = "unspecified"):
         if not isinstance(invalid_output, bool):
             raise ValueError("invalid_output must be boolean")
         self.scheduler_fallbacks += 1
+        category = self.record_scheduler_failure(reason)
+        self.scheduler_fallback_reasons[category] = (
+            self.scheduler_fallback_reasons.get(category, 0) + 1)
         if invalid_output:
             self.invalid_scheduler_outputs += 1
 
@@ -270,6 +322,20 @@ class MetricsCollector:
         self.rl_fallback_decisions = max(
             self.rl_fallback_decisions,
             counters["fallback_decisions"])
+        breaker = {}
+        for name in ("cooldown_count", "retry_count", "cooldown_remaining"):
+            value = diagnostics.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+            breaker[name] = value
+        self.rl_cooldown_count = max(
+            self.rl_cooldown_count, breaker["cooldown_count"])
+        self.rl_retry_count = max(
+            self.rl_retry_count, breaker["retry_count"])
+        self.rl_cooldown_remaining = breaker["cooldown_remaining"]
+        self.rl_max_cooldown_remaining = max(
+            self.rl_max_cooldown_remaining,
+            breaker["cooldown_remaining"])
 
     def record_scheduler_commit(self, algorithm_name: str,
                                 native: bool = True):
@@ -283,6 +349,78 @@ class MetricsCollector:
         name = str(algorithm_name or "unknown")
         self.commits_by_algorithm[name] = (
             self.commits_by_algorithm.get(name, 0) + 1)
+
+    def record_scheduler_solution(
+            self, algorithm_name: str, proposed_pair_count: int,
+            objective_value: Optional[float],
+            first_assignment_estimated_cost: Optional[float]):
+        """Separate a solver's joint proposal from its first physical attempt."""
+        if (isinstance(proposed_pair_count, bool) or
+                not isinstance(proposed_pair_count, int) or
+                proposed_pair_count <= 0):
+            raise ValueError("proposed pair count must be a positive integer")
+        for name, value in (
+                ("objective_value", objective_value),
+                ("first_assignment_estimated_cost",
+                 first_assignment_estimated_cost)):
+            if value is not None and (
+                    isinstance(value, bool) or
+                    not isinstance(value, (int, float)) or
+                    not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+        algorithm = str(algorithm_name or "unknown")
+        stats = self.solver_execution_by_algorithm.setdefault(algorithm, {
+            "joint_solution_count": 0,
+            "proposed_pair_count": 0,
+            "unattempted_pair_count": 0,
+            "first_assignment_attempt_count": 0,
+            "first_assignment_commit_count": 0,
+            "first_assignment_rejection_count": 0,
+            "joint_objective_sum": 0.0,
+            "joint_objective_observations": 0,
+            "first_assignment_estimated_cost_sum": 0.0,
+            "first_assignment_cost_observations": 0,
+        })
+        unattempted = max(0, proposed_pair_count - 1)
+        self.solver_joint_solution_count += 1
+        self.solver_proposed_pair_count += proposed_pair_count
+        self.solver_unattempted_pair_count += unattempted
+        self.first_assignment_attempt_count += 1
+        stats["joint_solution_count"] += 1
+        stats["proposed_pair_count"] += proposed_pair_count
+        stats["unattempted_pair_count"] += unattempted
+        stats["first_assignment_attempt_count"] += 1
+        if objective_value is not None:
+            self.solver_joint_objective_sum += float(objective_value)
+            self.solver_joint_objective_observations += 1
+            stats["joint_objective_sum"] += float(objective_value)
+            stats["joint_objective_observations"] += 1
+        if first_assignment_estimated_cost is not None:
+            self.first_assignment_estimated_cost_sum += float(
+                first_assignment_estimated_cost)
+            self.first_assignment_cost_observations += 1
+            stats["first_assignment_estimated_cost_sum"] += float(
+                first_assignment_estimated_cost)
+            stats["first_assignment_cost_observations"] += 1
+
+    def record_first_assignment_outcome(
+            self, algorithm_name: str, *, committed: bool):
+        if not isinstance(committed, bool):
+            raise ValueError("committed must be boolean")
+        algorithm = str(algorithm_name or "unknown")
+        if algorithm not in self.solver_execution_by_algorithm:
+            raise ValueError("first-assignment outcome has no recorded attempt")
+        stats = self.solver_execution_by_algorithm[algorithm]
+        recorded = (stats["first_assignment_commit_count"] +
+                    stats["first_assignment_rejection_count"])
+        if recorded >= stats["first_assignment_attempt_count"]:
+            raise ValueError("first-assignment outcomes exceed attempts")
+        if committed:
+            self.first_assignment_commit_count += 1
+            stats["first_assignment_commit_count"] += 1
+        else:
+            self.first_assignment_rejection_count += 1
+            stats["first_assignment_rejection_count"] += 1
 
     def record_unauthorized_route_write(self, sim_time: float, robot_id: int,
                                         source: str, path_version: int,
@@ -946,12 +1084,44 @@ class MetricsCollector:
             "scheduler_timeout_count": self.scheduler_timeout_count,
             "invalid_scheduler_outputs": self.invalid_scheduler_outputs,
             "scheduler_fallbacks": self.scheduler_fallbacks,
+            "scheduler_fallback_reasons": dict(sorted(
+                self.scheduler_fallback_reasons.items())),
+            "scheduler_failure_reasons": dict(sorted(
+                self.scheduler_failure_reasons.items())),
             "native_scheduler_commits": self.native_scheduler_commits,
             "fallback_scheduler_commits": self.fallback_scheduler_commits,
             "scheduler_commits_by_algorithm": dict(
                 self.commits_by_algorithm),
+            "solver_joint_solution_count": self.solver_joint_solution_count,
+            "solver_proposed_pair_count": self.solver_proposed_pair_count,
+            "solver_unattempted_pair_count": self.solver_unattempted_pair_count,
+            "solver_mean_pairs_per_solution": (
+                self.solver_proposed_pair_count /
+                self.solver_joint_solution_count
+                if self.solver_joint_solution_count else None),
+            "solver_joint_objective_mean": (
+                self.solver_joint_objective_sum /
+                self.solver_joint_objective_observations
+                if self.solver_joint_objective_observations else None),
+            "first_assignment_attempt_count": (
+                self.first_assignment_attempt_count),
+            "first_assignment_commit_count": self.first_assignment_commit_count,
+            "first_assignment_rejection_count": (
+                self.first_assignment_rejection_count),
+            "first_assignment_estimated_cost_mean": (
+                self.first_assignment_estimated_cost_sum /
+                self.first_assignment_cost_observations
+                if self.first_assignment_cost_observations else None),
+            "solver_execution_by_algorithm": {
+                name: dict(values) for name, values in sorted(
+                    self.solver_execution_by_algorithm.items())
+            },
             "rl_policy_decisions": self.rl_policy_decisions,
             "rl_fallback_decisions": self.rl_fallback_decisions,
+            "rl_cooldown_count": self.rl_cooldown_count,
+            "rl_retry_count": self.rl_retry_count,
+            "rl_cooldown_remaining": self.rl_cooldown_remaining,
+            "rl_max_cooldown_remaining": self.rl_max_cooldown_remaining,
             "rl_fallback_rate": (
                 self.rl_fallback_decisions /
                 (self.rl_policy_decisions + self.rl_fallback_decisions)

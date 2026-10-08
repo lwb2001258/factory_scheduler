@@ -75,6 +75,10 @@ class CostMatrix:
     tasks: Tuple[TransportTask, ...]
     values: np.ndarray
     feasible: np.ndarray
+    # The operational matrix floors negative priority/waiting-adjusted costs
+    # at zero.  Objective-specific training experts also need the value before
+    # that irreversible floor so they can remove those bonuses exactly.
+    unfloored_values: Optional[np.ndarray] = None
 
 
 def _greedy_permutation_seed(matrix: CostMatrix) -> Tuple[Tuple[int, ...],
@@ -318,21 +322,73 @@ class FCFSScheduler(BaseScheduler):
         super().__init__("FCFS")
     
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
-        if not pending_tasks:
+        result = self.assign(
+            pending_tasks, robot_states,
+            SchedulingContext(congestion_map=congestion_map))
+        if not result.assignments:
             return None
-        
-        idle_robots = self.get_idle_robots(robot_states)
-        if not idle_robots:
-            return None
-        
-        # Sort tasks by arrival time (oldest first)
-        sorted_tasks = sorted(pending_tasks, key=lambda t: t.arrival_time)
-        
-        # Assign the oldest task to the first idle robot
-        task = sorted_tasks[0]
-        robot_id = idle_robots[0]
-        
-        return (robot_id, task)
+        item = result.assignments[0]
+        return item.robot_id, item.task
+
+    def assign(self, pending_tasks, robot_states,
+               context: Optional[SchedulingContext] = None) -> SchedulerResult:
+        """Select the oldest task that has at least one feasible robot.
+
+        FCFS orders tasks, not robot/task pairs.  An unreachable oldest task
+        therefore cannot prevent a later pending task from being dispatched.
+        Once the first dispatchable task is found, its lowest-cost feasible
+        robot is selected deterministically.
+        """
+        context = context or SchedulingContext()
+        started = time.perf_counter()
+        try:
+            matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
+
+        columns = sorted(
+            range(len(matrix.tasks)),
+            key=lambda column: (
+                matrix.tasks[column].arrival_time,
+                matrix.tasks[column].task_id,
+            ),
+        )
+        for column in columns:
+            feasible_rows = [
+                row for row in range(len(matrix.robot_ids))
+                if matrix.feasible[row, column]
+            ]
+            if not feasible_rows:
+                continue
+            row = min(
+                feasible_rows,
+                key=lambda candidate: (
+                    float(matrix.values[candidate, column]),
+                    matrix.robot_ids[candidate],
+                ),
+            )
+            return _result_from_matching(
+                self.name, matrix, [(row, column)], pending_tasks,
+                robot_states, context, started,
+                diagnostics={
+                    "reason": "ok",
+                    "policy_order": "arrival_time_then_task_id",
+                    "cost_source": (
+                        "path" if context.path_cost_provider else "euclidean"),
+                },
+            )
+
+        return _result_from_matching(
+            self.name, matrix, [], pending_tasks, robot_states, context,
+            started,
+            diagnostics={
+                "reason": "no_feasible_pair",
+                "policy_order": "arrival_time_then_task_id",
+            },
+        )
 
 
 # ================================================================
@@ -350,30 +406,13 @@ class NearestNeighbourScheduler(BaseScheduler):
         super().__init__("NearestNeighbour")
     
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
-        if not pending_tasks:
+        result = self.assign(
+            pending_tasks, robot_states,
+            SchedulingContext(congestion_map=congestion_map))
+        if not result.assignments:
             return None
-        
-        idle_robots = self.get_idle_robots(robot_states)
-        if not idle_robots:
-            return None
-        
-        # Find the best (task, robot) pair by minimum distance
-        best_pair = None
-        best_distance = float('inf')
-        
-        for task in pending_tasks:
-            pickup_pos = task.pickup_position
-            for rid in idle_robots:
-                robot_pos = robot_states[rid]['position']
-                dist = math.sqrt(
-                    (robot_pos[0] - pickup_pos[0])**2 + 
-                    (robot_pos[1] - pickup_pos[1])**2
-                )
-                if dist < best_distance:
-                    best_distance = dist
-                    best_pair = (rid, task)
-        
-        return best_pair
+        item = result.assignments[0]
+        return item.robot_id, item.task
 
     def assign(self, pending_tasks, robot_states,
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
@@ -434,49 +473,93 @@ class RoundRobinScheduler(BaseScheduler):
     
     def __init__(self):
         super().__init__("RoundRobin")
+        self.last_committed_robot_id = None
+        # Kept for compatibility with existing diagnostics.  It advances only
+        # after commit and now records the committed robot ID, not a transient
+        # index into a robot-state snapshot.
         self.last_assigned_index = -1
     
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
-        if not pending_tasks:
+        result = self.assign(
+            pending_tasks, robot_states,
+            SchedulingContext(congestion_map=congestion_map))
+        if not result.assignments:
             return None
-        
-        idle_robots = self.get_idle_robots(robot_states)
-        if not idle_robots:
-            return None
-        
-        # Sort idle robots by ID for consistent ordering
-        idle_robots.sort()
-        
-        # Find next robot in round-robin order
-        # Start from the robot after the last assigned
-        robot_id = None
-        all_robot_ids = sorted(robot_states.keys())
-        
-        for i in range(len(all_robot_ids)):
-            idx = (self.last_assigned_index + 1 + i) % len(all_robot_ids)
-            candidate = all_robot_ids[idx]
-            if candidate in idle_robots:
-                robot_id = candidate
-                self.last_assigned_index = idx
-                break
-        
-        if robot_id is None:
-            return None
-        
-        # Assign the oldest pending task
-        sorted_tasks = sorted(pending_tasks, key=lambda t: t.arrival_time)
-        task = sorted_tasks[0]
-        
-        return (robot_id, task)
-    
+        item = result.assignments[0]
+        return item.robot_id, item.task
+
+    def assign(self, pending_tasks, robot_states,
+               context: Optional[SchedulingContext] = None) -> SchedulerResult:
+        """Propose the oldest feasible task without advancing rotation state."""
+        context = context or SchedulingContext()
+        started = time.perf_counter()
+        try:
+            matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
+
+        all_robot_ids = sorted(robot_states)
+        if self.last_committed_robot_id is None:
+            rotation = all_robot_ids
+        else:
+            rotation = [
+                robot_id for robot_id in all_robot_ids
+                if robot_id > self.last_committed_robot_id
+            ] + [
+                robot_id for robot_id in all_robot_ids
+                if robot_id <= self.last_committed_robot_id
+            ]
+        row_by_robot = {
+            robot_id: row for row, robot_id in enumerate(matrix.robot_ids)
+        }
+        columns = sorted(
+            range(len(matrix.tasks)),
+            key=lambda column: (
+                matrix.tasks[column].arrival_time,
+                matrix.tasks[column].task_id,
+            ),
+        )
+        for column in columns:
+            for robot_id in rotation:
+                row = row_by_robot.get(robot_id)
+                if row is None or not matrix.feasible[row, column]:
+                    continue
+                return _result_from_matching(
+                    self.name, matrix, [(row, column)], pending_tasks,
+                    robot_states, context, started,
+                    diagnostics={
+                        "reason": "ok",
+                        "rotation_after_robot_id": self.last_committed_robot_id,
+                        "policy_order": "oldest_task_then_round_robin_robot",
+                    },
+                )
+
+        return _result_from_matching(
+            self.name, matrix, [], pending_tasks, robot_states, context,
+            started,
+            diagnostics={
+                "reason": "no_feasible_pair",
+                "rotation_after_robot_id": self.last_committed_robot_id,
+            },
+        )
+
+    def on_assignment_committed(self, assignment: Assignment) -> None:
+        super().on_assignment_committed(assignment)
+        self.last_committed_robot_id = assignment.robot_id
+        self.last_assigned_index = assignment.robot_id
+
     def reset(self):
         super().reset()
+        self.last_committed_robot_id = None
         self.last_assigned_index = -1
 
 
-def _pair_cost(robot_id: int, task: TransportTask,
-               robot_states: Dict[int, dict],
-               context: SchedulingContext) -> float:
+def _unfloored_pair_cost(robot_id: int, task: TransportTask,
+                         robot_states: Dict[int, dict],
+                         context: SchedulingContext) -> float:
     if context.path_cost_provider is not None:
         try:
             travel = float(context.path_cost_provider(robot_id, task))
@@ -519,7 +602,14 @@ def _pair_cost(robot_id: int, task: TransportTask,
         - weights["waiting"] * waiting
         + weights["congestion"] * congestion
     )
-    return max(0.0, cost)
+    return float(cost)
+
+
+def _pair_cost(robot_id: int, task: TransportTask,
+               robot_states: Dict[int, dict],
+               context: SchedulingContext) -> float:
+    cost = _unfloored_pair_cost(robot_id, task, robot_states, context)
+    return max(0.0, cost) if math.isfinite(cost) else float("inf")
 
 
 def build_cost_matrix(pending_tasks: List[TransportTask],
@@ -542,16 +632,21 @@ def build_cost_matrix(pending_tasks: List[TransportTask],
         (task for task in pending_tasks if task.status == TaskStatus.PENDING),
         key=lambda task: task.task_id))
     values = np.full((len(robots), len(tasks)), np.inf, dtype=float)
+    unfloored_values = np.full_like(values, np.inf)
     feasible = np.zeros_like(values, dtype=bool)
     for row, robot_id in enumerate(robots):
         for column, task in enumerate(tasks):
             if (robot_id, task.task_id) in context.failed_pairs:
                 continue
-            cost = _pair_cost(robot_id, task, robot_states, context)
-            if math.isfinite(cost) and cost >= 0:
-                values[row, column] = cost
+            unfloored_cost = _unfloored_pair_cost(
+                robot_id, task, robot_states, context)
+            if math.isfinite(unfloored_cost):
+                unfloored_values[row, column] = unfloored_cost
+                values[row, column] = max(0.0, unfloored_cost)
                 feasible[row, column] = True
-    return CostMatrix(robots, tasks, values, feasible)
+    return CostMatrix(
+        robots, tasks, values, feasible,
+        unfloored_values=unfloored_values)
 
 
 def _result_from_matching(name: str, matrix: CostMatrix,
@@ -585,6 +680,15 @@ def _result_from_matching(name: str, matrix: CostMatrix,
     info.setdefault(
         "reason", "ok" if assignments else matching_reason)
     info["matching_size"] = len(assignments)
+    info["runtime_commit_contract"] = "first_assignment_only"
+    info["unattempted_solution_pairs"] = max(0, len(assignments) - 1)
+    if assignments:
+        first = assignments[0]
+        info["first_assignment"] = {
+            "robot_id": first.robot_id,
+            "task_id": first.task.task_id,
+            "estimated_cost": first.estimated_cost,
+        }
     return SchedulerResult(
         assignments=assignments,
         objective_value=objective,
@@ -647,7 +751,12 @@ class RandomScheduler(BaseScheduler):
 
     def __init__(self, seed: int = 42):
         super().__init__("Random")
+        self.seed = seed
         self.rng = random.Random(seed)
+
+    def reset(self):
+        super().reset()
+        self.rng.seed(self.seed)
 
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
         result = self.assign(
@@ -662,7 +771,13 @@ class RandomScheduler(BaseScheduler):
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
         started = time.perf_counter()
-        matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        try:
+            matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
         candidates = [
             (row, column)
             for row in range(len(matrix.robot_ids))
@@ -701,7 +816,13 @@ class HungarianScheduler(BaseScheduler):
         from scipy.optimize import linear_sum_assignment
         context = context or SchedulingContext()
         started = time.perf_counter()
-        matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        try:
+            matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
         if matrix.values.size == 0 or not np.any(matrix.feasible):
             return _result_from_matching(
                 self.name, matrix, [], pending_tasks, robot_states,
@@ -752,12 +873,31 @@ class AuctionScheduler(BaseScheduler):
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
         started = time.perf_counter()
-        deadline = started + self.time_budget_ms / 1000.0
-        matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        try:
+            matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
+        matrix_ready = time.perf_counter()
         if matrix.values.size == 0 or not np.any(matrix.feasible):
             return _result_from_matching(
                 self.name, matrix, [], pending_tasks, robot_states,
-                context, started)
+                context, started, {
+                    "matrix_build_ms": (matrix_ready - started) * 1000.0,
+                    "search_ms": 0.0,
+                    "search_budget_ms": self.time_budget_ms,
+                })
+
+        # Maintain a deterministic, maximum-cardinality feasible incumbent so
+        # an intentionally tiny search budget can never turn a valid problem
+        # into an empty scheduler result.
+        seed = _greedy_permutation_seed(matrix)
+        length = min(len(matrix.robot_ids), len(matrix.tasks))
+        incumbent_pairs = _feasible_pairs(matrix, seed, length)
+        search_started = time.perf_counter()
+        deadline = search_started + self.time_budget_ms / 1000.0
 
         # Auction requires bidders <= objects. Transpose when robots > tasks.
         transposed = len(matrix.robot_ids) > len(matrix.tasks)
@@ -795,15 +935,30 @@ class AuctionScheduler(BaseScheduler):
                 bidder_object[previous] = -1
                 queue.append(previous)
             iterations += 1
-        pairs = []
+        auction_pairs = []
         for bidder, obj in enumerate(bidder_object):
             if obj < 0:
                 continue
-            pairs.append((int(obj), bidder) if transposed
-                         else (bidder, int(obj)))
+            auction_pairs.append((int(obj), bidder) if transposed
+                                 else (bidder, int(obj)))
+        def pair_score(pairs):
+            return (
+                -len(pairs),
+                sum(float(matrix.values[row, column])
+                    for row, column in pairs),
+                tuple(sorted(pairs)),
+            )
+
+        if pair_score(auction_pairs) < pair_score(incumbent_pairs):
+            pairs = auction_pairs
+            incumbent_source = "auction"
+        else:
+            pairs = incumbent_pairs
+            incumbent_source = "feasible_seed"
+        search_finished = time.perf_counter()
         stop_reason = (
             "complete" if not queue else
-            "time_budget" if time.perf_counter() >= deadline
+            "time_budget" if search_finished >= deadline
             else "max_iterations")
         return _result_from_matching(
             self.name, matrix, pairs, pending_tasks, robot_states,
@@ -813,6 +968,10 @@ class AuctionScheduler(BaseScheduler):
                 "stop_reason": stop_reason,
                 "max_price": float(np.max(prices, initial=0.0)),
                 "centralized": True,
+                "incumbent_source": incumbent_source,
+                "matrix_build_ms": (matrix_ready - started) * 1000.0,
+                "search_ms": (search_finished - search_started) * 1000.0,
+                "search_budget_ms": self.time_budget_ms,
             })
 
 
@@ -822,10 +981,15 @@ class GeneticScheduler(BaseScheduler):
     def __init__(self, seed: int = 42, population_size: int = 32,
                  max_generations: int = 50, time_budget_ms: float = 5.0):
         super().__init__("GA")
+        self.seed = seed
         self.rng = random.Random(seed)
         self.population_size = max(2, population_size)
         self.max_generations = max(1, max_generations)
         self.time_budget_ms = max(0.1, time_budget_ms)
+
+    def reset(self):
+        super().reset()
+        self.rng.seed(self.seed)
 
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
         result = self.assign(
@@ -840,7 +1004,13 @@ class GeneticScheduler(BaseScheduler):
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
         started = time.perf_counter()
-        matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        try:
+            matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
         matrix_seconds = time.perf_counter() - started
         search_started = time.perf_counter()
         deadline = search_started + self.time_budget_ms / 1000.0
@@ -901,6 +1071,15 @@ class GeneticScheduler(BaseScheduler):
                     break
             population = next_population
             generations += 1
+        final_candidate = min(
+            population,
+            key=lambda item: _metaheuristic_score(
+                matrix, item, chromosome_length),
+        )
+        final_score = _metaheuristic_score(
+            matrix, final_candidate, chromosome_length)
+        if final_score < best_score:
+            best, best_score = final_candidate, final_score
         pairs = _feasible_pairs(matrix, best, chromosome_length)
         if not pairs:
             return SchedulerResult(
@@ -937,12 +1116,17 @@ class SimulatedAnnealingScheduler(BaseScheduler):
             raise ValueError("initial_temperature must be > 0")
         if not 0 < cooling_rate < 1:
             raise ValueError("cooling_rate must be in (0, 1)")
+        self.seed = seed
         self.rng = random.Random(seed)
         self.initial_temperature = initial_temperature
         self.cooling_rate = cooling_rate
         self.minimum_temperature = max(0.0, minimum_temperature)
         self.max_iterations = max(1, max_iterations)
         self.time_budget_ms = max(0.1, time_budget_ms)
+
+    def reset(self):
+        super().reset()
+        self.rng.seed(self.seed)
 
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
         result = self.assign(
@@ -957,7 +1141,13 @@ class SimulatedAnnealingScheduler(BaseScheduler):
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
         started = time.perf_counter()
-        matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        try:
+            matrix = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
         matrix_seconds = time.perf_counter() - started
         search_started = time.perf_counter()
         deadline = search_started + self.time_budget_ms / 1000.0
@@ -1052,6 +1242,10 @@ class PPONetwork:
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.hidden_size = hidden_size
+        self.ppo_training_contract_version = (
+            "pairwise-ppo-v2-action-reward-huber")
+        self.ppo_gamma = 1.0
+        self.value_huber_delta = 10.0
         
         # Initialize weights with HALF Xavier scale.
         # Half-scale gives well-bounded random outputs in the
@@ -1140,8 +1334,13 @@ class PPONetwork:
             "pairwise_v1" if self.action_dim > MAX_ROBOTS
             else "legacy_robot_state_v1")
         np.savez(filepath,
-                 schema_version=np.array([3], dtype=np.int64),
+                 schema_version=np.array([4], dtype=np.int64),
                  environment_version=np.array([RL_ENVIRONMENT_VERSION]),
+                 ppo_training_contract_version=np.array([
+                     self.ppo_training_contract_version]),
+                 ppo_gamma=np.array([self.ppo_gamma], dtype=np.float64),
+                 value_huber_delta=np.array(
+                     [self.value_huber_delta], dtype=np.float64),
                  action_semantics=np.array([action_semantics]),
                  observation_schema=np.array([observation_schema]),
                  state_dim=np.array([self.state_dim], dtype=np.int64),
@@ -1159,6 +1358,8 @@ class PPONetwork:
         required = {
             "schema_version", "environment_version", "state_dim",
             "action_dim", "hidden_size",
+            "ppo_training_contract_version", "ppo_gamma",
+            "value_huber_delta",
             "W1", "b1", "W2", "b2", "W_policy", "b_policy",
             "W_value", "b_value",
         }
@@ -1169,24 +1370,32 @@ class PPONetwork:
                     f"checkpoint metadata/weights missing: {sorted(missing)}")
             schema_version = int(data["schema_version"][0])
             environment_version = str(data["environment_version"][0])
-            if schema_version not in {2, 3}:
+            if schema_version != 4:
                 raise ModelValidationError(
-                    f"checkpoint schema {schema_version} not in supported {{2, 3}}")
-            if schema_version == 3:
-                semantic_fields = {"action_semantics", "observation_schema"}
-                semantic_missing = semantic_fields.difference(data.files)
-                if semantic_missing:
-                    raise ModelValidationError(
-                        "checkpoint semantic metadata missing: "
-                        f"{sorted(semantic_missing)}")
-                expected_action_semantics = (
-                    "robot_task_pair_plus_noop"
-                    if self.action_dim > MAX_ROBOTS else "legacy_robot_only")
-                action_semantics = str(data["action_semantics"][0])
-                if action_semantics != expected_action_semantics:
-                    raise ModelValidationError(
-                        "PPO action semantics mismatch: "
-                        f"{action_semantics!r} != {expected_action_semantics!r}")
+                    f"checkpoint schema {schema_version} is not supported 4")
+            semantic_fields = {"action_semantics", "observation_schema"}
+            semantic_missing = semantic_fields.difference(data.files)
+            if semantic_missing:
+                raise ModelValidationError(
+                    "checkpoint semantic metadata missing: "
+                    f"{sorted(semantic_missing)}")
+            expected_action_semantics = (
+                "robot_task_pair_plus_noop"
+                if self.action_dim > MAX_ROBOTS else "legacy_robot_only")
+            action_semantics = str(data["action_semantics"][0])
+            if action_semantics != expected_action_semantics:
+                raise ModelValidationError(
+                    "PPO action semantics mismatch: "
+                    f"{action_semantics!r} != {expected_action_semantics!r}")
+            contract_version = str(
+                data["ppo_training_contract_version"][0])
+            gamma = float(data["ppo_gamma"][0])
+            huber_delta = float(data["value_huber_delta"][0])
+            if (contract_version != self.ppo_training_contract_version or
+                    gamma != 1.0 or not math.isfinite(huber_delta) or
+                    huber_delta <= 0):
+                raise ModelValidationError(
+                    "PPO training objective contract mismatch")
             if environment_version != RL_ENVIRONMENT_VERSION:
                 raise ModelValidationError(
                     "PPO environment version mismatch: "
@@ -1215,8 +1424,10 @@ class PPONetwork:
                 if not np.all(np.isfinite(value)):
                     raise ModelValidationError(f"{key} contains NaN/Inf")
                 loaded[key] = value.copy()
+            loaded_training_contract = (gamma, huber_delta)
         for key, value in loaded.items():
             setattr(self, key, value)
+        self.ppo_gamma, self.value_huber_delta = loaded_training_contract
 
 
 class RLScheduler(BaseScheduler):
@@ -1731,6 +1942,8 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
                 return RLSchedulerSafetyWrapper(
                     PairwisePPOScheduler(model_path, seed=seed))
             except ModelValidationError as pairwise_error:
+                if not allow_safe_fallback:
+                    raise
                 legacy = RLScheduler(
                     model_path, seed=seed, deterministic=True)
                 legacy.legacy_checkpoint_reason = str(pairwise_error)

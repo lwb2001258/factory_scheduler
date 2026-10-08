@@ -17,7 +17,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from config import RobotState, TaskStatus
+from config import RL_ENVIRONMENT_VERSION, RobotState, TaskStatus
 from schedulers import (
     Assignment,
     BaseScheduler,
@@ -32,9 +32,11 @@ from schedulers import (
 from task_generator import TransportTask
 
 
-FEATURE_VERSION = "factory-pair-v1"
-RIDGE_MODEL_VERSION = "learned-cost-ridge-v1"
-GRAPH_MODEL_VERSION = "graph-edge-imitation-v1"
+FEATURE_VERSION = "factory-pair-v2-priority-horizon"
+RIDGE_MODEL_VERSION = "learned-cost-ridge-v5-unfloored-objective-expert"
+GRAPH_MODEL_VERSION = "graph-edge-imitation-v3-unfloored-objective-expert"
+WEBOTS_SHARED_SUPERVISION_VERSION = (
+    "webots-shared-supervision-v3-unfloored-dual-objective-expert")
 
 PAIR_FEATURE_NAMES = (
     "robot_x",
@@ -55,6 +57,8 @@ PAIR_FEATURE_NAMES = (
     "delivery_congestion",
     "idle_robot_count",
     "pending_task_count",
+    "task_horizon_limited",
+    "seconds_to_episode_end",
 )
 
 GRAPH_CONTEXT_FEATURE_NAMES = (
@@ -143,6 +147,17 @@ def pair_feature_vector(robot_id: int, task: TransportTask,
         1 for item in pending_tasks if item.status == TaskStatus.PENDING)
         if pending_count_override is None else
         max(0, int(pending_count_override)))
+    episode_end_time = _finite_number(
+        context.configuration.get(
+            "episode_end_time",
+            context.configuration.get("duration_seconds", 1800.0)),
+        1800.0,
+    )
+    if episode_end_time <= 0:
+        episode_end_time = 1800.0
+    horizon_limited = float(task.is_horizon_limited(episode_end_time))
+    seconds_to_episode_end = max(
+        0.0, episode_end_time - _finite_number(context.current_time))
     result = np.asarray([
         robot_x,
         robot_y,
@@ -163,6 +178,8 @@ def pair_feature_vector(robot_id: int, task: TransportTask,
         _congestion_at((delivery_x, delivery_y), context),
         float(idle_count),
         float(pending_count),
+        horizon_limited,
+        seconds_to_episode_end,
     ], dtype=np.float64)
     if result.shape != (len(PAIR_FEATURE_NAMES),) or not np.all(
             np.isfinite(result)):
@@ -315,12 +332,17 @@ class RidgeCostModel:
             target_name: str = "execution_time"):
         x, y = _validate_training_arrays(
             features, targets, len(PAIR_FEATURE_NAMES))
-        if np.any(y < 0):
-            raise ValueError("cost targets must be non-negative")
         if not math.isfinite(l2) or l2 < 0:
             raise ValueError("l2 must be finite and non-negative")
-        if target_name not in {"execution_time", "baseline_pair_cost"}:
+        supported_targets = {
+            "execution_time", "baseline_pair_cost",
+            "count_expert_cost", "utility_v2_expert_cost",
+        }
+        if target_name not in supported_targets:
             raise ValueError("unsupported learned-cost target")
+        if (target_name in {"execution_time", "baseline_pair_cost"} and
+                np.any(y < 0)):
+            raise ValueError("distance/time cost targets must be non-negative")
         mean = np.mean(x, axis=0)
         scale = np.std(x, axis=0)
         scale = np.where(scale < 1e-9, 1.0, scale)
@@ -351,13 +373,15 @@ class RidgeCostModel:
         values = self.intercept + ((x - self.mean) / self.scale) @ self.coefficients
         if not np.all(np.isfinite(values)):
             raise ValueError("model produced non-finite predictions")
-        values = np.maximum(values, 0.0)
+        if self.target_name in {"execution_time", "baseline_pair_cost"}:
+            values = np.maximum(values, 0.0)
         return values[0] if single else values
 
     def save(self, path) -> None:
         metadata = {
             "model_version": RIDGE_MODEL_VERSION,
             "feature_version": FEATURE_VERSION,
+            "environment_version": RL_ENVIRONMENT_VERSION,
             "feature_names": list(PAIR_FEATURE_NAMES),
             "training_samples": int(self.training_samples),
             "target_name": self.target_name,
@@ -373,7 +397,8 @@ class RidgeCostModel:
         metadata = _read_metadata(archive)
         if metadata.get("model_version") != RIDGE_MODEL_VERSION:
             raise ModelValidationError("unsupported learned-cost model version")
-        if (metadata.get("feature_version") != FEATURE_VERSION or
+        if (metadata.get("environment_version") != RL_ENVIRONMENT_VERSION or
+                metadata.get("feature_version") != FEATURE_VERSION or
                 tuple(metadata.get("feature_names", ())) != PAIR_FEATURE_NAMES):
             raise ModelValidationError("learned-cost feature contract mismatch")
         required = {"mean", "scale", "coefficients", "intercept"}
@@ -394,7 +419,9 @@ class RidgeCostModel:
                 not math.isfinite(intercept)):
             raise ModelValidationError("learned-cost parameters are invalid")
         target_name = metadata.get("target_name", "execution_time")
-        if target_name not in {"execution_time", "baseline_pair_cost"}:
+        if target_name not in {
+                "execution_time", "baseline_pair_cost",
+                "count_expert_cost", "utility_v2_expert_cost"}:
             raise ModelValidationError("unsupported learned-cost target")
         return cls(mean, scale, coefficients, intercept,
                    int(metadata.get("training_samples", 0)), target_name)
@@ -461,6 +488,7 @@ class GraphEdgeImitationModel:
         metadata = {
             "model_version": GRAPH_MODEL_VERSION,
             "feature_version": FEATURE_VERSION,
+            "environment_version": RL_ENVIRONMENT_VERSION,
             "feature_names": list(GRAPH_FEATURE_NAMES),
             "training_samples": int(self.training_samples),
         }
@@ -475,7 +503,8 @@ class GraphEdgeImitationModel:
         metadata = _read_metadata(archive)
         if metadata.get("model_version") != GRAPH_MODEL_VERSION:
             raise ModelValidationError("unsupported graph imitation model version")
-        if (metadata.get("feature_version") != FEATURE_VERSION or
+        if (metadata.get("environment_version") != RL_ENVIRONMENT_VERSION or
+                metadata.get("feature_version") != FEATURE_VERSION or
                 tuple(metadata.get("feature_names", ())) != GRAPH_FEATURE_NAMES):
             raise ModelValidationError("graph feature contract mismatch")
         required = {"mean", "scale", "weights", "intercept"}
@@ -522,6 +551,225 @@ def solve_hungarian(values: np.ndarray,
             if feasible[row, column]]
 
 
+def objective_expert_values(matrix: CostMatrix,
+                            context: SchedulingContext,
+                            objective: str) -> np.ndarray:
+    """Return a deterministic objective-specific imitation expert matrix.
+
+    Count removes the priority/waiting bonuses from the shared operational
+    cost so the expert focuses on short service cycles and throughput.
+    Utility retains those bonuses and adds deadline pressure using the formal
+    1/2/4 priority weights.  Feasibility always remains owned by the common
+    path-cost matrix.
+    """
+    if objective not in {"count", "utility_v2"}:
+        raise ValueError("expert objective must be count or utility_v2")
+    values = np.asarray(matrix.values, dtype=np.float64).copy()
+    if values.shape != matrix.feasible.shape:
+        raise ValueError("expert matrix shape differs from feasibility mask")
+    weights = {
+        "priority": 1.0,
+        "waiting": 0.01,
+    }
+    weights.update(context.configuration.get("cost_weights", {}))
+    now = max(0.0, _finite_number(context.current_time))
+    unfloored = matrix.unfloored_values
+    if unfloored is None:
+        raise ValueError(
+            "objective expert requires the unfloored operational cost matrix")
+    unfloored = np.asarray(unfloored, dtype=np.float64)
+    if (unfloored.shape != values.shape or
+            not np.all(np.isfinite(unfloored[matrix.feasible]))):
+        raise ValueError("objective expert unfloored costs are invalid")
+    # Both experts must start before the operational zero floor.  Utility then
+    # retains the priority/waiting bonuses, while Count removes them below.
+    values = unfloored.copy()
+    for column, task in enumerate(matrix.tasks):
+        waiting = max(0.0, now - float(task.arrival_time))
+        priority_bonus = (
+            float(weights["priority"]) *
+            max(0.0, float(task.priority) - 1.0))
+        waiting_bonus = float(weights["waiting"]) * waiting
+        if objective == "count":
+            # Undo priority/waiting terms on the pre-floor value.  Doing this
+            # from matrix.values would make a long-waiting task artificially
+            # expensive after the operational max(0, cost) lost information.
+            values[:, column] += priority_bonus + waiting_bonus
+            continue
+        priority_weight = {1: 1.0, 2: 2.0, 3: 4.0}[int(task.priority)]
+        deadline = task.max_completion_time_seconds
+        pressure = 0.0
+        if deadline is not None and deadline > 0:
+            pressure = min(1.0, max(0.0, waiting / float(deadline)))
+        values[:, column] -= 2.0 * priority_weight * pressure
+    if not np.all(np.isfinite(values[matrix.feasible])):
+        raise ValueError("objective expert produced non-finite feasible costs")
+    return values
+
+
+def objective_supervision_batches(matrix: CostMatrix,
+                                  pair_features: np.ndarray,
+                                  graph_features: np.ndarray,
+                                  context: SchedulingContext, *,
+                                  behavior_coordinate: tuple[int, int] | None =
+                                  None) -> dict:
+    """Label one scheduler snapshot for both formal objectives.
+
+    LearnedHungarian receives the complete feasible expert cost surface, not
+    only the edge selected by the expert.  GraphImitation receives every
+    expert-matching edge plus deterministic low-cost hard negatives.  Keeping
+    this logic shared by standalone collection and Webots telemetry prevents
+    the two training paths from silently learning different tasks.
+    """
+    expected_pair_shape = matrix.values.shape + (len(PAIR_FEATURE_NAMES),)
+    expected_graph_shape = matrix.values.shape + (len(GRAPH_FEATURE_NAMES),)
+    if pair_features.shape != expected_pair_shape:
+        raise ValueError("pair supervision tensor has an invalid shape")
+    if graph_features.shape != expected_graph_shape:
+        raise ValueError("graph supervision tensor has an invalid shape")
+    coordinates = [
+        (int(row), int(column))
+        for row, column in np.argwhere(matrix.feasible)]
+    if not coordinates:
+        raise ValueError("objective supervision has no feasible edges")
+
+    ridge_by_objective = {}
+    graph_by_objective = {}
+    for objective in ("count", "utility_v2"):
+        expert_values = objective_expert_values(matrix, context, objective)
+        expert = set(solve_hungarian(expert_values, matrix.feasible))
+        positives = sorted(expert)
+        negatives = [
+            coordinate for coordinate in coordinates
+            if coordinate not in expert]
+        negative_limit = max(4, 3 * len(positives))
+        chosen_negatives = []
+        if (behavior_coordinate is not None and
+                behavior_coordinate in negatives):
+            chosen_negatives.append(behavior_coordinate)
+        for coordinate in sorted(
+                negatives,
+                key=lambda item: (
+                    float(expert_values[item[0], item[1]]), item)):
+            if coordinate not in chosen_negatives:
+                chosen_negatives.append(coordinate)
+            if len(chosen_negatives) >= negative_limit:
+                break
+        graph_samples = positives + chosen_negatives
+        if not positives or not graph_samples:
+            raise ValueError("objective expert produced no supervision samples")
+
+        ridge_by_objective[objective] = {
+            "features": [
+                pair_features[row, column].tolist()
+                for row, column in coordinates],
+            "targets": [
+                float(expert_values[row, column])
+                for row, column in coordinates],
+            "sample_count": len(coordinates),
+        }
+        graph_by_objective[objective] = {
+            "features": [
+                graph_features[row, column].tolist()
+                for row, column in graph_samples],
+            "labels": [
+                float((row, column) in expert)
+                for row, column in graph_samples],
+            "positive_count": len(positives),
+            "negative_count": len(chosen_negatives),
+        }
+    return {
+        "ridge_by_objective": ridge_by_objective,
+        "graph_by_objective": graph_by_objective,
+    }
+
+
+def learned_cost_values(model: RidgeCostModel, matrix: CostMatrix,
+                        pair_features: np.ndarray,
+                        context: SchedulingContext) -> np.ndarray:
+    """Build the exact cost matrix consumed by LearnedHungarian."""
+    learned_values = np.full(matrix.values.shape, np.inf, dtype=np.float64)
+    predicted = model.predict(pair_features[matrix.feasible])
+    priority_weight = _finite_number(
+        context.configuration.get("learned_priority_weight", 1.0), 1.0)
+    waiting_weight = _finite_number(
+        context.configuration.get("learned_waiting_weight", 0.01), 0.01)
+    for index, (row, column) in enumerate(np.argwhere(matrix.feasible)):
+        task = matrix.tasks[int(column)]
+        urgency = 0.0
+        if model.target_name == "execution_time":
+            urgency = (
+                priority_weight * max(0.0, float(task.priority) - 1.0) +
+                waiting_weight * max(
+                    0.0, context.current_time - float(task.arrival_time)))
+        value = float(predicted[index]) - urgency
+        learned_values[row, column] = (
+            max(0.0, value)
+            if model.target_name in {"execution_time", "baseline_pair_cost"}
+            else value)
+    return learned_values
+
+
+def graph_imitation_values(model: "GraphEdgeImitationModel",
+                           matrix: CostMatrix,
+                           graph_features: np.ndarray) -> tuple[np.ndarray,
+                                                               np.ndarray]:
+    """Build GraphImitation matching costs and its probability matrix."""
+    probabilities = model.predict_proba(graph_features[matrix.feasible])
+    learned_values = np.full(matrix.values.shape, np.inf, dtype=np.float64)
+    probability_matrix = np.zeros(matrix.values.shape, dtype=np.float64)
+    base_scale = max(1.0, float(np.max(matrix.values[matrix.feasible])))
+    for index, (row, column) in enumerate(np.argwhere(matrix.feasible)):
+        probability = min(
+            1.0 - 1e-9, max(1e-9, float(probabilities[index])))
+        probability_matrix[row, column] = probability
+        learned_values[row, column] = (
+            -math.log(probability) +
+            1e-6 * float(matrix.values[row, column]) / base_scale)
+    return learned_values, probability_matrix
+
+
+def physical_supervision_snapshot(
+        assignment: Assignment, robot_states: Dict[int, dict],
+        pending_tasks: Sequence[TransportTask],
+        context: SchedulingContext) -> dict:
+    """Capture objective-isolated supervision from one physical decision.
+
+    The snapshot is telemetry only: it is computed after a route was found but
+    from the immutable pre-commit scheduler inputs.  It never changes the
+    assignment or Webots motion command.  Each objective receives labels from
+    its own deterministic expert, so behavior generated by another scheduler
+    is useful state coverage without being mistaken for an expert action.
+    """
+    matrix = build_cost_matrix(list(pending_tasks), robot_states, context)
+    pair_features = pair_feature_tensor(
+        matrix, robot_states, pending_tasks, context)
+    graph_features = graph_edge_feature_tensor(matrix, pair_features)
+    try:
+        selected_row = matrix.robot_ids.index(int(assignment.robot_id))
+        selected_column = next(
+            index for index, task in enumerate(matrix.tasks)
+            if int(task.task_id) == int(assignment.task.task_id))
+    except (ValueError, StopIteration) as exc:
+        raise ValueError(
+            "committed pair is absent from supervision snapshot") from exc
+    if not matrix.feasible[selected_row, selected_column]:
+        raise ValueError("committed pair is infeasible in supervision snapshot")
+
+    batches = objective_supervision_batches(
+        matrix, pair_features, graph_features, context,
+        behavior_coordinate=(selected_row, selected_column))
+    return {
+        "schema_version": 2,
+        "dataset_version": WEBOTS_SHARED_SUPERVISION_VERSION,
+        "environment_version": RL_ENVIRONMENT_VERSION,
+        "feature_version": FEATURE_VERSION,
+        "selected_pair_features":
+            pair_features[selected_row, selected_column].tolist(),
+        **batches,
+    }
+
+
 class _LearnedMatchingScheduler(BaseScheduler):
     """Shared structured adapter for learned full-matching schedulers."""
 
@@ -547,39 +795,49 @@ class LearnedCostHungarianScheduler(_LearnedMatchingScheduler):
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
         started = time.perf_counter()
-        base = build_cost_matrix(pending_tasks, robot_states, context)
+        try:
+            base = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
         if base.values.size == 0 or not np.any(base.feasible):
             return _result_from_matching(
                 self.name, base, [], pending_tasks, robot_states, context,
                 started, {"model_version": RIDGE_MODEL_VERSION})
         features = pair_feature_tensor(
             base, robot_states, pending_tasks, context)
-        learned_values = np.full(base.values.shape, np.inf, dtype=np.float64)
-        predicted = self.model.predict(features[base.feasible])
-        priority_weight = _finite_number(
-            context.configuration.get("learned_priority_weight", 1.0), 1.0)
-        waiting_weight = _finite_number(
-            context.configuration.get("learned_waiting_weight", 0.01), 0.01)
-        for index, (row, column) in enumerate(np.argwhere(base.feasible)):
-            task = base.tasks[int(column)]
-            urgency = 0.0
-            if self.model.target_name == "execution_time":
-                urgency = (
-                    priority_weight * max(0.0, float(task.priority) - 1.0) +
-                    waiting_weight * max(
-                        0.0, context.current_time - float(task.arrival_time)))
-            learned_values[row, column] = max(0.0, float(predicted[index]) - urgency)
+        learned_values = learned_cost_values(
+            self.model, base, features, context)
         learned = CostMatrix(
             base.robot_ids, base.tasks, learned_values, base.feasible.copy())
         pairs = solve_hungarian(learned.values, learned.feasible)
+        physical_fine_tune = os.environ.get(
+            "SMART_FACTORY_PHYSICAL_FINE_TUNE", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if physical_fine_tune:
+            pairs = pairs[:1]
+        diagnostics = {
+            "solver": "scipy.linear_sum_assignment",
+            "model_version": RIDGE_MODEL_VERSION,
+            "training_samples": self.model.training_samples,
+            "target_name": self.model.target_name,
+        }
+        if physical_fine_tune and pairs:
+            row, column = pairs[0]
+            diagnostics.update({
+                "physical_fine_tune": True,
+                "physical_rollout_step": {
+                    "kind": "learned_hungarian",
+                    "features": features[row, column].tolist(),
+                    "selected_robot_id": int(base.robot_ids[row]),
+                    "selected_task_id": int(base.tasks[column].task_id),
+                },
+            })
         return _result_from_matching(
             self.name, learned, pairs, pending_tasks, robot_states, context,
-            started, {
-                "solver": "scipy.linear_sum_assignment",
-                "model_version": RIDGE_MODEL_VERSION,
-                "training_samples": self.model.training_samples,
-                "target_name": self.model.target_name,
-            })
+            started, diagnostics)
 
 
 class GraphImitationScheduler(_LearnedMatchingScheduler):
@@ -594,7 +852,13 @@ class GraphImitationScheduler(_LearnedMatchingScheduler):
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
         started = time.perf_counter()
-        base = build_cost_matrix(pending_tasks, robot_states, context)
+        try:
+            base = build_cost_matrix(pending_tasks, robot_states, context)
+        except ValueError as exc:
+            return SchedulerResult(
+                computation_time=time.perf_counter() - started,
+                algorithm_name=self.name,
+                diagnostics={"reason": str(exc)})
         if base.values.size == 0 or not np.any(base.feasible):
             return _result_from_matching(
                 self.name, base, [], pending_tasks, robot_states, context,
@@ -602,33 +866,56 @@ class GraphImitationScheduler(_LearnedMatchingScheduler):
         pair_features = pair_feature_tensor(
             base, robot_states, pending_tasks, context)
         graph_features = graph_edge_feature_tensor(base, pair_features)
-        probabilities = self.model.predict_proba(
-            graph_features[base.feasible])
-        learned_values = np.full(base.values.shape, np.inf, dtype=np.float64)
-        probability_matrix = np.zeros(base.values.shape, dtype=np.float64)
-        base_scale = max(1.0, float(np.max(base.values[base.feasible])))
-        for index, (row, column) in enumerate(np.argwhere(base.feasible)):
-            probability = min(1.0 - 1e-9, max(1e-9,
-                float(probabilities[index])))
-            probability_matrix[row, column] = probability
-            # The base-cost term is only a deterministic tie-breaker. The
-            # learned expert probability owns the primary edge ordering.
-            learned_values[row, column] = (
-                -math.log(probability) +
-                1e-6 * float(base.values[row, column]) / base_scale)
+        learned_values, probability_matrix = graph_imitation_values(
+            self.model, base, graph_features)
         learned = CostMatrix(
             base.robot_ids, base.tasks, learned_values, base.feasible.copy())
         pairs = solve_hungarian(learned.values, learned.feasible)
+        physical_fine_tune = os.environ.get(
+            "SMART_FACTORY_PHYSICAL_FINE_TUNE", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if physical_fine_tune:
+            pairs = pairs[:1]
+        diagnostics = {
+            "solver": "scipy.linear_sum_assignment",
+            "model_version": GRAPH_MODEL_VERSION,
+            "training_samples": self.model.training_samples,
+            "mean_selected_probability": float(np.mean([
+                probability_matrix[row, column]
+                for row, column in pairs])) if pairs else 0.0,
+        }
+        if physical_fine_tune and pairs:
+            selected_row, selected_column = pairs[0]
+            objective = os.environ.get(
+                "SMART_FACTORY_FINE_TUNE_OBJECTIVE", "utility_v2").strip()
+            expert_values = objective_expert_values(
+                base, context, objective)
+            expert = set(solve_hungarian(expert_values, base.feasible))
+            coordinates = [tuple(map(int, value)) for value in
+                           np.argwhere(base.feasible)]
+            positives = sorted(expert)[:2]
+            negatives = sorted(
+                value for value in coordinates if value not in expert)[:2]
+            samples = positives + negatives
+            diagnostics.update({
+                "physical_fine_tune": True,
+                "physical_rollout_step": {
+                    "kind": "graph_imitation",
+                    "training_features": [
+                        graph_features[row, column].tolist()
+                        for row, column in samples],
+                    "training_labels": [
+                        float((row, column) in expert)
+                        for row, column in samples],
+                    "selected_robot_id": int(
+                        base.robot_ids[selected_row]),
+                    "selected_task_id": int(
+                        base.tasks[selected_column].task_id),
+                },
+            })
         return _result_from_matching(
             self.name, learned, pairs, pending_tasks, robot_states, context,
-            started, {
-                "solver": "scipy.linear_sum_assignment",
-                "model_version": GRAPH_MODEL_VERSION,
-                "training_samples": self.model.training_samples,
-                "mean_selected_probability": float(np.mean([
-                    probability_matrix[row, column]
-                    for row, column in pairs])) if pairs else 0.0,
-            })
+            started, diagnostics)
 
 
 def attach_learning_trace(task: TransportTask, assignment: Assignment,
@@ -650,6 +937,7 @@ def attach_learning_trace(task: TransportTask, assignment: Assignment,
             pending_count_override=len(pending_tasks))
         task.learning_trace = {
             "feature_version": FEATURE_VERSION,
+            "environment_version": RL_ENVIRONMENT_VERSION,
             "feature_names": list(PAIR_FEATURE_NAMES),
             "features": [float(value) for value in features],
             "algorithm": str(algorithm_name),
@@ -675,7 +963,8 @@ def completion_samples(documents: Iterable[dict]) -> Tuple[np.ndarray, np.ndarra
         for completion in document.get("task_completions", []):
             trace = completion.get("learning_trace") or {}
             target = completion.get("execution_time")
-            if (trace.get("feature_version") != FEATURE_VERSION or
+            if (trace.get("environment_version") != RL_ENVIRONMENT_VERSION or
+                    trace.get("feature_version") != FEATURE_VERSION or
                     tuple(trace.get("feature_names", ())) != PAIR_FEATURE_NAMES):
                 continue
             vector = trace.get("features")

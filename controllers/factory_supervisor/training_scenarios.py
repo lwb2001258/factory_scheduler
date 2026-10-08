@@ -9,8 +9,10 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from config import (ALL_LOCATIONS, INITIAL_BATTERY_MAX, INITIAL_BATTERY_MIN,
-                    PARKING_HEADINGS, PARKING_SPOTS, PLANNER_KEEP_OUT_BOXES,
-                    REST_NODES, SCENARIOS, STORAGE_AREAS, WAYPOINTS,
+                    GOAL_TOLERANCE, PARKING_HEADINGS, PARKING_SPOTS,
+                    PLANNER_KEEP_OUT_BOXES,
+                    REST_NODES, RL_ENVIRONMENT_VERSION, SCENARIOS,
+                    STORAGE_AREAS, WAYPOINTS,
                     WORKSTATIONS, RobotState)
 from grid_planner import GRID_RES, OccupancyGrid
 from motion_coordinator import MotionCoordinator
@@ -121,6 +123,15 @@ class FactoryAStarCostOracle:
     def segment(self, start, goal):
         start = (float(start[0]), float(start[1]))
         goal = (float(goal[0]), float(goal[1]))
+        # Both physical and headless dispatch treat a robot inside this
+        # tolerance as already at the pickup.  Grid A* can legitimately
+        # return ``None`` when the two world positions quantize to the same
+        # cell, which used to turn an otherwise valid dispatch into an
+        # infinite scheduler cost before the delivery route was even tried.
+        # Keep the scheduling mask consistent with the commit state machine.
+        if math.hypot(start[0] - goal[0], start[1] - goal[1]) <= (
+                GOAL_TOLERANCE * 2.5):
+            return 0.0
         key = (start, goal)
         if key not in self.cache:
             path = self.coordinator.grid_planner.plan(start, goal, smooth=True)
@@ -213,6 +224,7 @@ def factory_scenario(seed: int, max_robots=8, max_tasks=20,
                 "num_robots": robot_count,
                 "task_interval_seconds": scenario_config["task_interval"],
                 "duration_seconds": metadata["duration_seconds"],
+                "environment_version": RL_ENVIRONMENT_VERSION,
                 "simulation_timestep_ms": metadata["timestep_ms"],
                 "task_manifest_sha256": document["task_manifest_sha256"],
                 "manifest_sha256": document["manifest_sha256"],
@@ -268,4 +280,6 @@ def factory_scenario(seed: int, max_robots=8, max_tasks=20,
         configuration={
             "training_geometry": "factory-grid-astar-v3-online",
             "scenario_mode": "legacy_random_snapshot",
+            "duration_seconds": float(duration_seconds),
+            "environment_version": RL_ENVIRONMENT_VERSION,
         })

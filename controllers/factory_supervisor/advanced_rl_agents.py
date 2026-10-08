@@ -12,6 +12,8 @@ independent algorithms:
 None of these classes owns path planning or robot control.
 """
 
+import hashlib
+import json
 import math
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -24,6 +26,16 @@ from advanced_ai_common import (
 )
 from config import RL_ENVIRONMENT_VERSION
 from schedulers import ModelValidationError
+
+
+CQL_DATASET_VERSION = "cql-offline-dataset-v2-fixed-behavior"
+CQL_COLLECTION_MODE = "fixed_offline_behavior"
+
+
+def _valid_sha256(value) -> bool:
+    return bool(
+        isinstance(value, str) and len(value) == 64 and
+        all(character in "0123456789abcdef" for character in value))
 
 
 def _config_from_metadata(metadata: dict, cls):
@@ -439,9 +451,12 @@ class DenseQNetwork:
 class RainbowConfig:
     hidden_size: int = 64
     atoms: int = 51
-    value_min: float = -100.0
+    value_min: float = -500.0
     value_max: float = 100.0
-    gamma: float = 0.99
+    raw_reward_min: float = -50_000.0
+    raw_reward_max: float = 10_000.0
+    reward_scale: float = 100.0
+    gamma: float = 1.0
     n_step: int = 3
     replay_capacity: int = 20000
     batch_size: int = 64
@@ -464,12 +479,18 @@ class RainbowConfig:
             _check_integer(name, value, minimum=minimum)
         for name, value in (
                 ("value_min", self.value_min),
-                ("value_max", self.value_max)):
+                ("value_max", self.value_max),
+                ("raw_reward_min", self.raw_reward_min),
+                ("raw_reward_max", self.raw_reward_max)):
             _check_finite(name, value)
+        _check_finite("reward_scale", self.reward_scale, positive=True)
         _check_finite("learning_rate", self.learning_rate, positive=True)
         _check_finite("priority_alpha", self.priority_alpha,
                       nonnegative=True)
-        if self.value_max <= self.value_min:
+        if (self.value_max <= self.value_min or
+                self.raw_reward_max <= self.raw_reward_min or
+                self.value_min > self.raw_reward_min / self.reward_scale or
+                self.value_max < self.raw_reward_max / self.reward_scale):
             raise ValueError("invalid Rainbow configuration")
         _check_probability("gamma", self.gamma)
         _check_probability("priority_beta", self.priority_beta)
@@ -505,6 +526,10 @@ class RainbowDQNAgent:
         self.n_step = NStepAccumulator(
             self.config.n_step, self.config.gamma)
         self.training_step = 0
+        self.projection_atom_count = 0
+        self.projection_probability_mass = 0.0
+        self.projection_saturated_low = 0.0
+        self.projection_saturated_high = 0.0
 
     def _expected(self, probabilities):
         return np.sum(probabilities * self.support, axis=-1)
@@ -522,6 +547,8 @@ class RainbowDQNAgent:
 
     def remember(self, state, action_mask, action, reward,
                  next_state, next_action_mask, done) -> int:
+        _check_finite("reward", reward)
+        reward = float(reward) / self.config.reward_scale
         emitted = self.n_step.add(
             state, action_mask, action, reward,
             next_state, next_action_mask, done)
@@ -535,6 +562,12 @@ class RainbowDQNAgent:
         target = np.zeros((batch, self.config.atoms), dtype=np.float32)
         transformed = rewards[:, None] + (
             (1.0-dones) * discounts)[:, None] * self.support[None, :]
+        self.projection_atom_count += int(transformed.size)
+        self.projection_probability_mass += float(np.sum(next_probabilities))
+        self.projection_saturated_low += float(np.sum(np.where(
+            transformed < self.config.value_min, next_probabilities, 0.0)))
+        self.projection_saturated_high += float(np.sum(np.where(
+            transformed > self.config.value_max, next_probabilities, 0.0)))
         transformed = np.clip(
             transformed, self.config.value_min, self.config.value_max)
         delta = ((self.config.value_max-self.config.value_min) /
@@ -552,6 +585,26 @@ class RainbowDQNAgent:
                     target[row, lo] += probability * (hi-positions[row, atom])
                     target[row, hi] += probability * (positions[row, atom]-lo)
         return target
+
+    def projection_audit(self) -> dict:
+        total = self.projection_probability_mass
+        saturated = (
+            self.projection_saturated_low + self.projection_saturated_high)
+        return {
+            "projection_atom_count": self.projection_atom_count,
+            "projection_probability_mass": self.projection_probability_mass,
+            "projection_saturated_low": self.projection_saturated_low,
+            "projection_saturated_high": self.projection_saturated_high,
+            "projection_saturation_rate": (
+                saturated / total if total else 0.0),
+            "raw_reward_min": self.config.raw_reward_min,
+            "raw_reward_max": self.config.raw_reward_max,
+            "reward_scale": self.config.reward_scale,
+            "raw_support_min": (
+                self.config.value_min * self.config.reward_scale),
+            "raw_support_max": (
+                self.config.value_max * self.config.reward_scale),
+        }
 
     def train_step(self) -> Optional[float]:
         minimum = max(self.config.batch_size, self.config.warmup_steps)
@@ -603,6 +656,7 @@ class RainbowDQNAgent:
             "config": asdict(self.config),
             "training_step": self.training_step,
             "seed": self.seed,
+            "projection_audit": self.projection_audit(),
         }
         arrays = _network_arrays("online", self.online.params)
         arrays.update(_network_arrays("target", self.target.params))
@@ -624,6 +678,29 @@ class RainbowDQNAgent:
         agent.optimizer.restore(arrays, "adam")
         agent.training_step = _restore_training_step(
             metadata, agent.optimizer)
+        audit = metadata.get("projection_audit", {})
+        try:
+            counters = {
+                name: float(audit.get(name, 0.0)) for name in (
+                    "projection_probability_mass", "projection_saturated_low",
+                    "projection_saturated_high")
+            }
+        except (TypeError, ValueError) as exc:
+            raise ModelValidationError(
+                "invalid Rainbow projection audit") from exc
+        if any(value < 0 for value in counters.values()):
+            raise ModelValidationError("invalid Rainbow projection audit")
+        atom_count = audit.get("projection_atom_count", 0)
+        if (isinstance(atom_count, bool) or not isinstance(atom_count, int) or
+                atom_count < 0):
+            raise ModelValidationError("invalid Rainbow projection audit")
+        agent.projection_atom_count = atom_count
+        agent.projection_probability_mass = counters[
+            "projection_probability_mass"]
+        agent.projection_saturated_low = counters[
+            "projection_saturated_low"]
+        agent.projection_saturated_high = counters[
+            "projection_saturated_high"]
         return agent
 
 
@@ -633,7 +710,7 @@ class QRDQNConfig:
     quantiles: int = 32
     risk_fraction: float = 1.0
     huber_kappa: float = 1.0
-    gamma: float = 0.99
+    gamma: float = 1.0
     n_step: int = 3
     replay_capacity: int = 20000
     batch_size: int = 64
@@ -800,7 +877,7 @@ class QRDQNAgent:
 @dataclass(frozen=True)
 class CQLConfig:
     hidden_size: int = 64
-    gamma: float = 0.99
+    gamma: float = 1.0
     conservative_weight: float = 1.0
     replay_capacity: int = 50000
     batch_size: int = 64
@@ -849,6 +926,8 @@ class CQLAgent:
             self.config.replay_capacity, alpha=self.config.priority_alpha,
             seed=seed)
         self.training_step = 0
+        self.offline_dataset_history = []
+        self.offline_dataset_contracts = []
 
     def action_values(self, state):
         return np.asarray(self.online.forward(state), dtype=np.float64)
@@ -858,6 +937,11 @@ class CQLAgent:
 
     def remember(self, state, action_mask, action, reward,
                  next_state, next_action_mask, done):
+        raise RuntimeError(
+            "CQL is offline-only; ingest a frozen OfflineTransitionDataset")
+
+    def _remember_offline(self, state, action_mask, action, reward,
+                          next_state, next_action_mask, done):
         state = np.asarray(state, np.float32)
         next_state = np.asarray(next_state, np.float32)
         mask = validate_action_mask(action_mask, self.action_dim).copy()
@@ -874,6 +958,39 @@ class CQLAgent:
         self.replay.add(ReplayTransition(
             state.copy(), mask, int(action), float(reward),
             next_state.copy(), next_mask, bool(done), self.config.gamma))
+
+    def ingest_offline_dataset(self, dataset: "OfflineTransitionDataset"):
+        if not isinstance(dataset, OfflineTransitionDataset):
+            raise ValueError("CQL requires an OfflineTransitionDataset")
+        if (dataset.state_dim != self.state_dim or
+                dataset.action_dim != self.action_dim):
+            raise ValueError("dataset dimensions do not match CQL agent")
+        if len(self.replay):
+            raise RuntimeError(
+                "CQL replay is frozen; load a checkpoint before rebinding")
+        if len(dataset.states) > self.config.replay_capacity:
+            raise ValueError(
+                "CQL replay capacity cannot hold the complete dataset")
+        dataset_hash = dataset.sha256
+        for row in range(len(dataset.states)):
+            self._remember_offline(
+                dataset.states[row], dataset.action_masks[row],
+                dataset.actions[row], dataset.rewards[row],
+                dataset.next_states[row], dataset.next_action_masks[row],
+                dataset.dones[row])
+        if dataset_hash not in self.offline_dataset_history:
+            self.offline_dataset_history.append(dataset_hash)
+            self.offline_dataset_contracts.append({
+                "dataset_version": dataset.dataset_version,
+                "dataset_sha256": dataset_hash,
+                "behavior_policy": dataset.behavior_policy,
+                "collection_mode": dataset.collection_mode,
+                "objective": dataset.objective,
+                "seeds": list(dataset.seeds),
+                "manifest_hashes": list(dataset.manifest_hashes),
+                "coverage": dataset.coverage_audit(),
+            })
+        return self.offline_dataset_contracts[-1]
 
     def train_step(self) -> Optional[float]:
         minimum = max(self.config.batch_size, self.config.warmup_steps)
@@ -930,6 +1047,9 @@ class CQLAgent:
         return loss
 
     def save(self, path):
+        if not self.offline_dataset_history:
+            raise ValueError(
+                "CQL checkpoint requires a frozen offline dataset contract")
         metadata = {
             "algorithm": self.ALGORITHM,
             "environment_version": RL_ENVIRONMENT_VERSION,
@@ -939,6 +1059,11 @@ class CQLAgent:
             "config": asdict(self.config),
             "training_step": self.training_step,
             "seed": self.seed,
+            "offline_training_contract": {
+                "mode": "offline_only",
+                "dataset_history": list(self.offline_dataset_history),
+                "datasets": list(self.offline_dataset_contracts),
+            },
         }
         arrays = _network_arrays("online", self.online.params)
         arrays.update(_network_arrays("target", self.target.params))
@@ -959,6 +1084,60 @@ class CQLAgent:
         agent.optimizer.restore(arrays, "adam")
         agent.training_step = _restore_training_step(
             metadata, agent.optimizer)
+        contract = metadata.get("offline_training_contract")
+        if (not isinstance(contract, dict) or
+                contract.get("mode") != "offline_only" or
+                not isinstance(contract.get("dataset_history"), list) or
+                not contract["dataset_history"] or
+                not isinstance(contract.get("datasets"), list) or
+                len(contract["datasets"]) != len(
+                    contract["dataset_history"])):
+            raise ModelValidationError(
+                "CQL checkpoint lacks its offline dataset contract")
+        history = contract["dataset_history"]
+        datasets = contract["datasets"]
+        def valid_dataset_contract(row, digest):
+            if (not isinstance(row, dict) or
+                    row.get("dataset_sha256") != digest or
+                    row.get("dataset_version") != CQL_DATASET_VERSION or
+                    row.get("collection_mode") != CQL_COLLECTION_MODE or
+                    not isinstance(row.get("behavior_policy"), str) or
+                    not row["behavior_policy"].strip() or
+                    row.get("objective") not in {
+                        "count", "utility_v2", "legacy_reward"}):
+                return False
+            seeds = row.get("seeds")
+            manifests = row.get("manifest_hashes")
+            coverage = row.get("coverage")
+            if (not isinstance(seeds, list) or not seeds or
+                    len(set(seeds)) != len(seeds) or any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in seeds) or
+                    not isinstance(manifests, list) or
+                    any(not _valid_sha256(value) for value in manifests) or
+                    not isinstance(coverage, dict)):
+                return False
+            row_count = coverage.get("row_count")
+            rows_by_seed = coverage.get("rows_by_seed")
+            return bool(
+                isinstance(row_count, int) and row_count > 0 and
+                coverage.get("state_dim") == state_dim and
+                coverage.get("action_dim") == action_dim and
+                coverage.get("seed_count") == len(seeds) and
+                isinstance(rows_by_seed, dict) and
+                set(rows_by_seed) == {str(value) for value in seeds} and
+                all(isinstance(value, int) and value > 0
+                    for value in rows_by_seed.values()) and
+                sum(rows_by_seed.values()) == row_count)
+
+        if (len(set(history)) != len(history) or
+                any(not _valid_sha256(value) for value in history) or
+                any(not valid_dataset_contract(row, digest)
+                    for row, digest in zip(datasets, history))):
+            raise ModelValidationError(
+                "CQL checkpoint offline dataset contract is invalid")
+        agent.offline_dataset_history = list(history)
+        agent.offline_dataset_contracts = [dict(row) for row in datasets]
         return agent
 
 
@@ -973,10 +1152,15 @@ class OfflineTransitionDataset:
     dones: np.ndarray
     behavior_policy: str
     seeds: Tuple[int, ...]
+    transition_seeds: Optional[np.ndarray] = None
+    objective: str = "legacy_reward"
+    collection_mode: str = CQL_COLLECTION_MODE
+    manifest_hashes: Tuple[str, ...] = ()
+    dataset_version: str = CQL_DATASET_VERSION
 
     def __post_init__(self):
-        states = np.asarray(self.states, dtype=np.float32)
-        next_states = np.asarray(self.next_states, dtype=np.float32)
+        states = np.array(self.states, dtype=np.float32, copy=True)
+        next_states = np.array(self.next_states, dtype=np.float32, copy=True)
         raw_masks = np.asarray(self.action_masks)
         raw_next_masks = np.asarray(self.next_action_masks)
         raw_actions = np.asarray(self.actions)
@@ -992,11 +1176,11 @@ class OfflineTransitionDataset:
                 not np.all(np.isfinite(raw_dones)) or
                 not np.all(np.isin(raw_dones, (0, 1)))):
             raise ValueError("offline masks, actions or dones are invalid")
-        masks = raw_masks.astype(bool, copy=False)
-        next_masks = raw_next_masks.astype(bool, copy=False)
-        actions = raw_actions.astype(np.int64, copy=False)
-        rewards = np.asarray(self.rewards, dtype=np.float32)
-        dones = raw_dones.astype(bool, copy=False)
+        masks = raw_masks.astype(bool, copy=True)
+        next_masks = raw_next_masks.astype(bool, copy=True)
+        actions = raw_actions.astype(np.int64, copy=True)
+        rewards = np.array(self.rewards, dtype=np.float32, copy=True)
+        dones = raw_dones.astype(bool, copy=True)
         raw_seeds = tuple(self.seeds)
         if (not raw_seeds or any(
                 isinstance(seed, bool) or
@@ -1004,7 +1188,26 @@ class OfflineTransitionDataset:
                 for seed in raw_seeds)):
             raise ValueError("offline dataset seeds must be integers")
         seeds = tuple(int(seed) for seed in raw_seeds)
+        if len(set(seeds)) != len(seeds):
+            raise ValueError("offline dataset seeds must be unique")
         count = len(states)
+        if self.transition_seeds is None:
+            if len(seeds) != 1:
+                raise ValueError(
+                    "multi-seed dataset requires transition provenance")
+            transition_seeds = np.full(count, seeds[0], dtype=np.int64)
+        else:
+            raw_transition_seeds = np.asarray(self.transition_seeds)
+            if (raw_transition_seeds.dtype.kind not in "iu" or
+                    raw_transition_seeds.shape != (count,)):
+                raise ValueError("transition seeds are invalid")
+            transition_seeds = raw_transition_seeds.astype(
+                np.int64, copy=True)
+        manifest_hashes = tuple(self.manifest_hashes)
+        if any(
+                not _valid_sha256(value)
+                for value in manifest_hashes):
+            raise ValueError("manifest hashes must be lowercase SHA-256")
         if (states.ndim != 2 or next_states.shape != states.shape or
                 masks.ndim != 2 or next_masks.shape != masks.shape or
                 masks.shape[0] != count or actions.shape != (count,) or
@@ -1017,7 +1220,12 @@ class OfflineTransitionDataset:
                 np.any(~masks.any(axis=1)) or
                 np.any(~next_masks.any(axis=1)) or
                 np.any(actions < 0) or np.any(actions >= masks.shape[1]) or
-                np.any(~masks[np.arange(count), actions])):
+                np.any(~masks[np.arange(count), actions]) or
+                not np.all(np.isin(transition_seeds, seeds)) or
+                set(transition_seeds.tolist()) != set(seeds) or
+                self.objective not in {"count", "utility_v2", "legacy_reward"} or
+                self.collection_mode != CQL_COLLECTION_MODE or
+                self.dataset_version != CQL_DATASET_VERSION):
             raise ValueError("invalid offline transition dataset")
         object.__setattr__(self, "states", states)
         object.__setattr__(self, "next_states", next_states)
@@ -1028,6 +1236,13 @@ class OfflineTransitionDataset:
         object.__setattr__(self, "dones", dones)
         object.__setattr__(self, "behavior_policy", self.behavior_policy.strip())
         object.__setattr__(self, "seeds", seeds)
+        object.__setattr__(self, "transition_seeds", transition_seeds)
+        object.__setattr__(self, "objective", str(self.objective))
+        object.__setattr__(self, "manifest_hashes", manifest_hashes)
+        for array in (
+                states, next_states, masks, next_masks, actions, rewards,
+                dones, transition_seeds):
+            array.setflags(write=False)
 
     @property
     def state_dim(self):
@@ -1037,15 +1252,67 @@ class OfflineTransitionDataset:
     def action_dim(self):
         return self.action_masks.shape[1]
 
+    def coverage_audit(self) -> dict:
+        count = len(self.states)
+        unique, frequencies = np.unique(
+            self.actions, return_counts=True)
+        legal_counts = self.action_masks.sum(axis=1)
+        seed_rows = {
+            str(seed): int(np.sum(self.transition_seeds == seed))
+            for seed in self.seeds
+        }
+        return {
+            "row_count": count,
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+            "seed_count": len(self.seeds),
+            "rows_by_seed": seed_rows,
+            "unique_action_count": len(unique),
+            "action_coverage_fraction": len(unique) / self.action_dim,
+            "action_histogram": {
+                str(int(action)): int(frequency)
+                for action, frequency in zip(unique, frequencies)},
+            "no_op_count": int(np.sum(self.actions == self.action_dim - 1)),
+            "terminal_count": int(np.sum(self.dones)),
+            "legal_action_count_min": int(np.min(legal_counts)),
+            "legal_action_count_max": int(np.max(legal_counts)),
+            "legal_action_count_mean": float(np.mean(legal_counts)),
+            "reward_min": float(np.min(self.rewards)),
+            "reward_max": float(np.max(self.rewards)),
+            "reward_mean": float(np.mean(self.rewards)),
+            "reward_std": float(np.std(self.rewards)),
+        }
+
+    @property
+    def sha256(self) -> str:
+        header = {
+            "dataset_version": self.dataset_version,
+            "environment_version": RL_ENVIRONMENT_VERSION,
+            "behavior_policy": self.behavior_policy,
+            "collection_mode": self.collection_mode,
+            "objective": self.objective,
+            "seeds": list(self.seeds),
+            "manifest_hashes": list(self.manifest_hashes),
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+        }
+        digest = hashlib.sha256(json.dumps(
+            header, sort_keys=True, separators=(",", ":"),
+            allow_nan=False).encode("utf-8"))
+        arrays = (
+            self.states, self.action_masks, self.actions, self.rewards,
+            self.next_states, self.next_action_masks, self.dones,
+            self.transition_seeds,
+        )
+        for array in arrays:
+            contiguous = np.ascontiguousarray(array)
+            digest.update(contiguous.dtype.str.encode("ascii"))
+            digest.update(json.dumps(contiguous.shape).encode("ascii"))
+            digest.update(contiguous.tobytes())
+        return digest.hexdigest()
+
     def add_to(self, agent: CQLAgent) -> None:
-        if (agent.state_dim != self.state_dim or
-                agent.action_dim != self.action_dim):
-            raise ValueError("dataset dimensions do not match CQL agent")
-        for row in range(len(self.states)):
-            agent.remember(
-                self.states[row], self.action_masks[row], self.actions[row],
-                self.rewards[row], self.next_states[row],
-                self.next_action_masks[row], self.dones[row])
+        agent.ingest_offline_dataset(self)
 
     def save(self, path) -> None:
         metadata = {
@@ -1055,6 +1322,12 @@ class OfflineTransitionDataset:
             "action_dim": self.action_dim,
             "behavior_policy": self.behavior_policy,
             "seeds": list(self.seeds),
+            "objective": self.objective,
+            "collection_mode": self.collection_mode,
+            "manifest_hashes": list(self.manifest_hashes),
+            "dataset_version": self.dataset_version,
+            "dataset_sha256": self.sha256,
+            "coverage": self.coverage_audit(),
         }
         save_checkpoint(path, metadata, {
             "states": self.states,
@@ -1064,6 +1337,7 @@ class OfflineTransitionDataset:
             "next_states": self.next_states,
             "next_action_masks": self.next_action_masks,
             "dones": self.dones,
+            "transition_seeds": self.transition_seeds,
         })
 
     @classmethod
@@ -1071,14 +1345,23 @@ class OfflineTransitionDataset:
         metadata, arrays = load_checkpoint(
             path, expected_algorithm="CQLDataset")
         try:
+            if (metadata.get("dataset_version") != CQL_DATASET_VERSION or
+                    metadata.get("collection_mode") != CQL_COLLECTION_MODE):
+                raise ValueError("unsupported CQL dataset contract")
             dataset = cls(
                 arrays["states"], arrays["action_masks"], arrays["actions"],
                 arrays["rewards"], arrays["next_states"],
                 arrays["next_action_masks"], arrays["dones"],
                 str(metadata["behavior_policy"]),
-                tuple(metadata["seeds"]))
+                tuple(metadata["seeds"]), arrays["transition_seeds"],
+                str(metadata["objective"]),
+                str(metadata["collection_mode"]),
+                tuple(metadata.get("manifest_hashes", ())),
+                str(metadata["dataset_version"]))
             if (dataset.state_dim != metadata["state_dim"] or
-                    dataset.action_dim != metadata["action_dim"]):
+                    dataset.action_dim != metadata["action_dim"] or
+                    dataset.sha256 != metadata.get("dataset_sha256") or
+                    dataset.coverage_audit() != metadata.get("coverage")):
                 raise ValueError("dataset metadata dimensions do not match")
             return dataset
         except (KeyError, TypeError, ValueError) as exc:

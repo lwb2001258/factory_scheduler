@@ -13,6 +13,17 @@ from rl_environment import ENVIRONMENT_VERSION
 from schedulers import ModelValidationError
 
 
+SARSA_STATE_VERSION = "sarsa-state-v2-priority-robot-task-slots"
+SARSA_STATE_BUCKET_COUNT = 49
+DQN_MODEL_VERSION = "dqn-v2-action-reward-priority-slots"
+DQN_TRAINING_CONTRACT = {
+    "candidate_selection": "priority_waiting_feasibility_v7",
+    "reward_attribution": "task_lifecycle_action_level",
+    "return_gamma": 1.0,
+    "replay_resume": "checkpoint_exact",
+}
+
+
 def _legal_actions(mask: np.ndarray) -> np.ndarray:
     mask = np.asarray(mask, dtype=bool)
     return np.flatnonzero(mask)
@@ -21,10 +32,26 @@ def _legal_actions(mask: np.ndarray) -> np.ndarray:
 @dataclass
 class SarsaConfig:
     learning_rate: float = 0.1
-    gamma: float = 0.99
+    gamma: float = 1.0
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay: float = 0.995
+    epsilon_decay: float = 0.97
+    physical_epsilon_cap: float = 0.02
+
+    def __post_init__(self):
+        numeric = (
+            self.learning_rate, self.gamma, self.epsilon_start,
+            self.epsilon_end, self.epsilon_decay,
+            self.physical_epsilon_cap,
+        )
+        if (any(isinstance(value, bool) or not isinstance(
+                    value, (int, float)) or not np.isfinite(value)
+                for value in numeric) or
+                not 0 < self.learning_rate <= 1 or self.gamma != 1.0 or
+                not 0 <= self.epsilon_end <= self.epsilon_start <= 1 or
+                not 0 < self.epsilon_decay < 1 or
+                not 0 <= self.physical_epsilon_cap <= self.epsilon_end):
+            raise ValueError("invalid SARSA configuration")
 
 
 class SarsaAgent:
@@ -43,29 +70,71 @@ class SarsaAgent:
 
     @staticmethod
     def discretize(observation: np.ndarray) -> Tuple[int, ...]:
-        """Compact, stable buckets derived from the global observation prefix."""
+        """Bucket global load plus the leading robot/task decision slots."""
         obs = np.asarray(observation, dtype=np.float32)
-        if obs.size < 6 or not np.isfinite(obs).all():
+        # RL v7 fixed layout: 6 global + 8*8 robot + 20*9 task + masks.
+        if obs.size < 278 or not np.isfinite(obs).all():
             raise ValueError("invalid observation")
-        return (
+        buckets = [
             int(np.clip(obs[1] * 5, 0, 5)),  # pending ratio
             int(np.clip(obs[2] * 5, 0, 5)),  # idle ratio
             int(np.clip(obs[3] * 4, 0, 4)),  # congestion
             int(np.clip(obs[4] * 10, 0, 10)),  # feasible pair density
             int(np.clip(obs[0] * 5, 0, 20)),  # time
-        )
+        ]
+        robot_start = 6
+        task_start = robot_start + 8 * 8
+        robot_mask_start = task_start + 20 * 9
+        task_mask_start = robot_mask_start + 8
+        for slot in range(4):
+            offset = robot_start + slot * 8
+            buckets.extend((
+                int(obs[robot_mask_start + slot] > 0.5),
+                int(np.clip((obs[offset] + 1.0) * 4, 0, 8)),
+                int(np.clip((obs[offset + 1] + 1.0) * 4, 0, 8)),
+                int(obs[offset + 2] > 0.5),
+                int(np.clip(obs[offset + 3] * 5, 0, 5)),
+            ))
+        for slot in range(4):
+            offset = task_start + slot * 9
+            buckets.extend((
+                int(obs[task_mask_start + slot] > 0.5),
+                int(np.clip(round(obs[offset + 4] * 2), 0, 3)),
+                int(np.clip(obs[offset + 5] * 2, 0, 20)),
+                int(obs[offset + 6] > 0.5),
+                int(np.clip(obs[offset + 7] * 4, 0, 4)),
+                int(np.clip(obs[offset + 8] * 4, 0, 20)),
+            ))
+        result = tuple(buckets)
+        if len(result) != SARSA_STATE_BUCKET_COUNT:
+            raise RuntimeError("SARSA state contract length mismatch")
+        return result
 
     def values(self, state: Tuple[int, ...]) -> np.ndarray:
+        if (not isinstance(state, tuple) or
+                len(state) != SARSA_STATE_BUCKET_COUNT or
+                any(isinstance(value, bool) or not isinstance(
+                    value, (int, np.integer)) for value in state)):
+            raise ValueError("invalid SARSA discrete state")
         if state not in self.q_table:
             self.q_table[state] = np.zeros(self.action_dim, dtype=np.float32)
         return self.q_table[state]
 
     def select_action(self, state: Tuple[int, ...], action_mask: np.ndarray,
-                      training: bool = True) -> int:
+                      training: bool = True,
+                      exploration_cap: Optional[float] = None) -> int:
         legal = _legal_actions(action_mask)
         if not legal.size:
             return self.no_op_action
-        if training and self.rng.random() < self.epsilon:
+        epsilon = self.epsilon
+        if exploration_cap is not None:
+            if (isinstance(exploration_cap, bool) or
+                    not isinstance(exploration_cap, (int, float)) or
+                    not np.isfinite(exploration_cap) or
+                    not 0 <= exploration_cap <= 1):
+                raise ValueError("exploration cap must lie in [0, 1]")
+            epsilon = min(epsilon, float(exploration_cap))
+        if training and self.rng.random() < epsilon:
             return int(self.rng.choice(legal))
         q = self.values(state)
         return int(legal[np.argmax(q[legal])])
@@ -73,6 +142,16 @@ class SarsaAgent:
     def update(self, state: Tuple[int, ...], action: int, reward: float,
                next_state: Tuple[int, ...], next_action: int,
                done: bool) -> float:
+        if (isinstance(action, bool) or not isinstance(
+                action, (int, np.integer)) or
+                isinstance(next_action, bool) or not isinstance(
+                    next_action, (int, np.integer)) or
+                not 0 <= int(action) < self.action_dim or
+                not 0 <= int(next_action) < self.action_dim or
+                isinstance(reward, bool) or not isinstance(
+                    reward, (int, float, np.integer, np.floating)) or
+                not np.isfinite(reward) or not isinstance(done, bool)):
+            raise ValueError("invalid SARSA update")
         q = self.values(state)
         target = float(reward)
         if not done:
@@ -91,6 +170,7 @@ class SarsaAgent:
     def save(self, path: str) -> None:
         payload = {
             "algorithm": "SARSA", "environment_version": ENVIRONMENT_VERSION,
+            "state_version": SARSA_STATE_VERSION,
             "action_dim": self.action_dim, "no_op_action": self.no_op_action,
             "epsilon": self.epsilon, "episode": self.episode,
             "config": asdict(self.config), "seed": self.seed,
@@ -109,23 +189,45 @@ class SarsaAgent:
             raise ModelValidationError("checkpoint algorithm is not SARSA")
         if payload.get("environment_version") != ENVIRONMENT_VERSION:
             raise ModelValidationError("SARSA environment version mismatch")
+        if payload.get("state_version") != SARSA_STATE_VERSION:
+            raise ModelValidationError("SARSA state version mismatch")
         if payload.get("action_dim") != self.action_dim:
             raise ModelValidationError("SARSA action dimension mismatch")
-        self.epsilon = float(payload["epsilon"])
-        self.episode = int(payload["episode"])
+        if payload.get("no_op_action") != self.no_op_action:
+            raise ModelValidationError("SARSA no-op action mismatch")
+        try:
+            raw_config = payload.get("config")
+            if not isinstance(raw_config, dict):
+                raise ValueError("config is missing")
+            config = SarsaConfig(**raw_config)
+            epsilon = float(payload["epsilon"])
+            episode = int(payload["episode"])
+            if (not np.isfinite(epsilon) or
+                    not config.epsilon_end <= epsilon <=
+                    config.epsilon_start or episode < 0):
+                raise ValueError("epsilon or episode is invalid")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ModelValidationError(
+                f"invalid SARSA training state: {exc}") from exc
+        self.config = config
+        self.epsilon = epsilon
+        self.episode = episode
         self.q_table = {}
         for key, value in payload.get("q_table", {}).items():
             array = np.asarray(value, dtype=np.float32)
-            if array.shape != (self.action_dim,) or not np.isfinite(array).all():
+            state = tuple(map(int, key.split("|")))
+            if (len(state) != SARSA_STATE_BUCKET_COUNT or
+                    array.shape != (self.action_dim,) or
+                    not np.isfinite(array).all()):
                 raise ModelValidationError("invalid SARSA Q table")
-            self.q_table[tuple(map(int, key.split("|")))] = array
+            self.q_table[state] = array
 
 
 @dataclass
 class DQNConfig:
     hidden_size: int = 64
     learning_rate: float = 5e-4
-    gamma: float = 0.99
+    gamma: float = 1.0
     batch_size: int = 64
     replay_capacity: int = 20000
     warmup_steps: int = 256
@@ -133,11 +235,41 @@ class DQNConfig:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 20000
+    physical_epsilon_cap: float = 0.02
     max_grad_norm: float = 5.0
     double_dqn: bool = True
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
+
+    def __post_init__(self):
+        integers = (
+            self.hidden_size, self.batch_size, self.replay_capacity,
+            self.warmup_steps, self.target_update_interval,
+            self.epsilon_decay_steps,
+        )
+        numeric = (
+            self.learning_rate, self.gamma, self.epsilon_start,
+            self.epsilon_end, self.physical_epsilon_cap,
+            self.max_grad_norm, self.adam_beta1, self.adam_beta2,
+            self.adam_epsilon,
+        )
+        if (any(isinstance(value, bool) or not isinstance(
+                    value, (int, np.integer)) or int(value) <= 0
+                for value in integers) or
+                any(isinstance(value, bool) or not isinstance(
+                    value, (int, float, np.integer, np.floating)) or
+                    not np.isfinite(value) for value in numeric) or
+                not isinstance(self.double_dqn, bool) or
+                not 0 < self.learning_rate <= 1 or self.gamma != 1.0 or
+                self.replay_capacity < self.batch_size or
+                self.warmup_steps < self.batch_size or
+                not 0 <= self.epsilon_end <= self.epsilon_start <= 1 or
+                not 0 <= self.physical_epsilon_cap <= self.epsilon_end or
+                self.max_grad_norm <= 0 or
+                not 0 <= self.adam_beta1 < 1 or
+                not 0 <= self.adam_beta2 < 1 or self.adam_epsilon <= 0):
+            raise ValueError("invalid DQN configuration")
 
 
 def dqn_config_from_checkpoint(path: str) -> DQNConfig:
@@ -147,13 +279,22 @@ def dqn_config_from_checkpoint(path: str) -> DQNConfig:
             payload = pickle.load(handle)
     except Exception as exc:
         raise ModelValidationError(f"DQN checkpoint unreadable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ModelValidationError("DQN checkpoint payload must be an object")
     if payload.get("algorithm") != "DQN":
         raise ModelValidationError("checkpoint algorithm is not DQN")
-    raw = payload.get("config", {})
-    allowed = DQNConfig.__dataclass_fields__
+    if payload.get("model_version") != DQN_MODEL_VERSION:
+        raise ModelValidationError("DQN model version mismatch")
+    if payload.get("environment_version") != ENVIRONMENT_VERSION:
+        raise ModelValidationError("DQN environment version mismatch")
+    if payload.get("training_contract") != DQN_TRAINING_CONTRACT:
+        raise ModelValidationError("DQN training contract mismatch")
+    raw = payload.get("config")
+    expected = set(DQNConfig.__dataclass_fields__)
     try:
-        return DQNConfig(**{key: value for key, value in raw.items()
-                           if key in allowed})
+        if not isinstance(raw, dict) or set(raw) != expected:
+            raise ValueError("DQN config fields are incomplete or unknown")
+        return DQNConfig(**raw)
     except (TypeError, ValueError) as exc:
         raise ModelValidationError(f"invalid DQN checkpoint config: {exc}") from exc
 
@@ -240,6 +381,14 @@ class ReplayBuffer:
 class DQNAgent:
     def __init__(self, state_dim: int, action_dim: int, no_op_action: int,
                  config: Optional[DQNConfig] = None, seed: int = 42):
+        if (isinstance(state_dim, bool) or not isinstance(
+                state_dim, (int, np.integer)) or int(state_dim) <= 0 or
+                isinstance(action_dim, bool) or not isinstance(
+                    action_dim, (int, np.integer)) or int(action_dim) <= 0 or
+                isinstance(no_op_action, bool) or not isinstance(
+                    no_op_action, (int, np.integer)) or
+                not 0 <= int(no_op_action) < int(action_dim)):
+            raise ValueError("invalid DQN dimensions")
         self.state_dim, self.action_dim = state_dim, action_dim
         self.no_op_action = no_op_action
         self.config = config or DQNConfig()
@@ -260,19 +409,47 @@ class DQNAgent:
             key: np.zeros_like(value) for key, value in self.online.params.items()}
 
     def select_action(self, state: np.ndarray, action_mask: np.ndarray,
-                      training: bool = True) -> int:
+                      training: bool = True,
+                      exploration_cap: Optional[float] = None) -> int:
         legal = _legal_actions(action_mask)
         if not legal.size:
             return self.no_op_action
-        if training and self.rng.random() < self.epsilon:
+        epsilon = self.epsilon
+        if exploration_cap is not None:
+            if (isinstance(exploration_cap, bool) or
+                    not isinstance(exploration_cap, (int, float)) or
+                    not np.isfinite(exploration_cap) or
+                    not 0 <= exploration_cap <= 1):
+                raise ValueError("exploration cap must lie in [0, 1]")
+            epsilon = min(epsilon, float(exploration_cap))
+        if training and self.rng.random() < epsilon:
             return int(self.rng.choice(legal))
         q = self.online.forward(state)
         if not np.isfinite(q).all():
             raise ValueError("non-finite DQN output")
         return int(legal[np.argmax(q[legal])])
 
-    def remember(self, *transition) -> None:
-        self.replay.add(*transition)
+    def remember(self, state, action, reward, next_state, done,
+                 next_action_mask) -> None:
+        state = np.asarray(state, np.float32)
+        next_state = np.asarray(next_state, np.float32)
+        next_action_mask = np.asarray(next_action_mask, bool)
+        if (state.shape != (self.state_dim,) or
+                next_state.shape != (self.state_dim,) or
+                not np.isfinite(state).all() or
+                not np.isfinite(next_state).all() or
+                isinstance(action, bool) or not isinstance(
+                    action, (int, np.integer)) or
+                not 0 <= int(action) < self.action_dim or
+                isinstance(reward, bool) or not isinstance(
+                    reward, (int, float, np.integer, np.floating)) or
+                not np.isfinite(reward) or not isinstance(done, bool) or
+                next_action_mask.shape != (self.action_dim,) or
+                (not done and not next_action_mask.any())):
+            raise ValueError("invalid DQN replay transition")
+        self.replay.add(
+            state, int(action), float(reward), next_state, done,
+            next_action_mask)
 
     def _targets(self, rewards, next_states, dones, next_masks):
         online_q = self.online.forward(next_states)
@@ -338,7 +515,9 @@ class DQNAgent:
 
     def save(self, path: str) -> None:
         payload = {
-            "algorithm": "DQN", "environment_version": ENVIRONMENT_VERSION,
+            "algorithm": "DQN", "model_version": DQN_MODEL_VERSION,
+            "environment_version": ENVIRONMENT_VERSION,
+            "training_contract": dict(DQN_TRAINING_CONTRACT),
             "state_dim": self.state_dim, "action_dim": self.action_dim,
             "no_op_action": self.no_op_action, "config": asdict(self.config),
             "training_step": self.training_step, "episode": self.episode,
@@ -346,6 +525,9 @@ class DQNAgent:
             "online": self.online.params, "target": self.target.params,
             "optimizer_m": self.optimizer_m,
             "optimizer_v": self.optimizer_v,
+            "agent_rng_state": self.rng.bit_generator.state,
+            "replay_rng_state": self.replay.rng.bit_generator.state,
+            "replay": list(self.replay.data),
         }
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with Path(path).open("wb") as handle:
@@ -357,30 +539,85 @@ class DQNAgent:
                 payload = pickle.load(handle)
         except Exception as exc:
             raise ModelValidationError(f"DQN checkpoint unreadable: {exc}") from exc
-        expected = ("DQN", ENVIRONMENT_VERSION, self.state_dim, self.action_dim)
-        actual = (payload.get("algorithm"), payload.get("environment_version"),
-                  payload.get("state_dim"), payload.get("action_dim"))
+        if not isinstance(payload, dict):
+            raise ModelValidationError(
+                "DQN checkpoint payload must be an object")
+        expected = (
+            "DQN", DQN_MODEL_VERSION, ENVIRONMENT_VERSION, self.state_dim,
+            self.action_dim, self.no_op_action, DQN_TRAINING_CONTRACT,
+            asdict(self.config))
+        actual = (
+            payload.get("algorithm"), payload.get("model_version"),
+            payload.get("environment_version"), payload.get("state_dim"),
+            payload.get("action_dim"), payload.get("no_op_action"),
+            payload.get("training_contract"), payload.get("config"))
         if actual != expected:
             raise ModelValidationError("DQN checkpoint metadata mismatch")
         for network_name, network in (("online", self.online),
                                       ("target", self.target)):
             params = payload.get(network_name, {})
+            if not isinstance(params, dict) or set(params) != set(network.params):
+                raise ModelValidationError(
+                    f"invalid DQN parameter set {network_name}")
             for key, target in network.params.items():
                 value = np.asarray(params.get(key), np.float32)
                 if value.shape != target.shape or not np.isfinite(value).all():
                     raise ModelValidationError(
                         f"invalid DQN parameter {network_name}.{key}")
                 target[...] = value
-        self.training_step = int(payload["training_step"])
-        self.episode = int(payload["episode"])
-        self.epsilon = float(payload["epsilon"])
+        try:
+            raw_training_step = payload["training_step"]
+            raw_episode = payload["episode"]
+            raw_seed = payload["seed"]
+            if (isinstance(raw_training_step, bool) or
+                    not isinstance(raw_training_step, (int, np.integer)) or
+                    isinstance(raw_episode, bool) or
+                    not isinstance(raw_episode, (int, np.integer)) or
+                    isinstance(raw_seed, bool) or
+                    not isinstance(raw_seed, (int, np.integer))):
+                raise ValueError("DQN counters and seed must be integers")
+            training_step = int(raw_training_step)
+            episode = int(raw_episode)
+            seed = int(raw_seed)
+            epsilon = float(payload["epsilon"])
+            if (training_step < 0 or episode < 0 or seed < 0 or
+                    not np.isfinite(epsilon) or
+                    not self.config.epsilon_end <= epsilon <=
+                    self.config.epsilon_start):
+                raise ValueError("invalid DQN training counters")
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ModelValidationError(
+                f"invalid DQN training state: {exc}") from exc
+        self.training_step = training_step
+        self.episode = episode
+        self.epsilon = epsilon
+        self.seed = seed
         for state_name, target_state in (
                 ("optimizer_m", self.optimizer_m),
                 ("optimizer_v", self.optimizer_v)):
             state = payload.get(state_name, {})
+            if (not isinstance(state, dict) or
+                    set(state) != set(target_state)):
+                raise ModelValidationError(
+                    f"invalid DQN optimizer state set {state_name}")
             for key, target in target_state.items():
                 value = np.asarray(state.get(key), np.float32)
                 if value.shape != target.shape or not np.isfinite(value).all():
                     raise ModelValidationError(
                         f"invalid DQN optimizer state {state_name}.{key}")
                 target[...] = value
+        replay = payload.get("replay")
+        if (not isinstance(replay, list) or
+                len(replay) > self.config.replay_capacity):
+            raise ModelValidationError("invalid DQN replay state")
+        self.replay = ReplayBuffer(self.config.replay_capacity, self.seed)
+        try:
+            for transition in replay:
+                if not isinstance(transition, tuple) or len(transition) != 6:
+                    raise ValueError("malformed replay row")
+                self.remember(*transition)
+            self.rng.bit_generator.state = payload["agent_rng_state"]
+            self.replay.rng.bit_generator.state = payload["replay_rng_state"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModelValidationError(
+                f"invalid DQN stochastic resume state: {exc}") from exc

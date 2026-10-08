@@ -16,12 +16,14 @@ from schedulers import (
     AuctionScheduler, BaseScheduler, FCFSScheduler, GreedyScheduler,
     HungarianScheduler, ModelValidationError, NearestNeighbourScheduler,
     SchedulerResult, SchedulingContext, build_cost_matrix,
+    validate_assignments,
 )
 from training_scenarios import factory_scenario
 
 
 LINUCB_ALGORITHM = "LinUCB"
 LINUCB_CONTEXT_VERSION = "factory-bandit-context-v1"
+LINUCB_MODEL_VERSION = "factory-linucb-v2-action-reward-audit"
 DEFAULT_BANDIT_ARMS = (
     "FCFS", "NearestNeighbour", "Greedy", "Hungarian", "Auction",
 )
@@ -132,6 +134,9 @@ class LinUCBModel:
     covariance: np.ndarray
     reward_sum: np.ndarray
     training_samples: int = 0
+    arm_update_counts: Optional[np.ndarray] = None
+    arm_reward_totals: Optional[np.ndarray] = None
+    arm_reward_square_totals: Optional[np.ndarray] = None
 
     @classmethod
     def create(cls, arms: Sequence[str] = DEFAULT_BANDIT_ARMS,
@@ -147,23 +152,54 @@ class LinUCBModel:
             np.eye(dimension, dtype=np.float64)[None, :, :],
             len(arms), axis=0)
         reward_sum = np.zeros((len(arms), dimension), dtype=np.float64)
-        return cls(arms, float(alpha), covariance, reward_sum, 0)
+        zeros = np.zeros(len(arms), dtype=np.float64)
+        return cls(
+            arms, float(alpha), covariance, reward_sum, 0,
+            np.zeros(len(arms), dtype=np.int64), zeros.copy(), zeros.copy())
 
     def __post_init__(self):
         self.arms = tuple(self.arms)
         dimension = len(BANDIT_CONTEXT_FEATURES)
         self.covariance = np.asarray(self.covariance, dtype=np.float64)
         self.reward_sum = np.asarray(self.reward_sum, dtype=np.float64)
+        if self.arm_update_counts is None:
+            self.arm_update_counts = np.zeros(len(self.arms), dtype=np.int64)
+        else:
+            raw_counts = np.asarray(self.arm_update_counts)
+            if (raw_counts.dtype.kind not in "iu" or
+                    raw_counts.shape != (len(self.arms),) or
+                    np.any(raw_counts < 0)):
+                raise ValueError("invalid LinUCB arm update counts")
+            self.arm_update_counts = raw_counts.astype(np.int64, copy=True)
+        if self.arm_reward_totals is None:
+            self.arm_reward_totals = np.zeros(len(self.arms), dtype=np.float64)
+        else:
+            self.arm_reward_totals = np.asarray(
+                self.arm_reward_totals, dtype=np.float64)
+        if self.arm_reward_square_totals is None:
+            self.arm_reward_square_totals = np.zeros(
+                len(self.arms), dtype=np.float64)
+        else:
+            self.arm_reward_square_totals = np.asarray(
+                self.arm_reward_square_totals, dtype=np.float64)
         if (not self.arms or len(self.arms) != len(set(self.arms)) or
                 self.covariance.shape != (len(self.arms), dimension, dimension) or
                 self.reward_sum.shape != (len(self.arms), dimension) or
+                self.arm_reward_totals.shape != (len(self.arms),) or
+                self.arm_reward_square_totals.shape != (len(self.arms),) or
                 not np.all(np.isfinite(self.covariance)) or
                 not np.all(np.isfinite(self.reward_sum)) or
+                not np.all(np.isfinite(self.arm_reward_totals)) or
+                not np.all(np.isfinite(self.arm_reward_square_totals)) or
+                np.any(self.arm_reward_square_totals < 0) or
                 not math.isfinite(self.alpha) or self.alpha < 0 or
                 isinstance(self.training_samples, bool) or
                 not isinstance(self.training_samples, (int, np.integer)) or
                 int(self.training_samples) < 0):
             raise ValueError("invalid LinUCB parameters")
+        if int(np.sum(self.arm_update_counts)) != int(self.training_samples):
+            raise ValueError(
+                "LinUCB per-arm updates do not match training samples")
         for arm, matrix in zip(self.arms, self.covariance):
             _arm_factory(arm)
             if not np.allclose(matrix, matrix.T, atol=1e-10):
@@ -209,7 +245,33 @@ class LinUCBModel:
             raise ValueError(f"unknown LinUCB arm: {arm}") from exc
         self.covariance[index] += np.outer(vector, vector)
         self.reward_sum[index] += float(reward)*vector
+        self.arm_update_counts[index] += 1
+        self.arm_reward_totals[index] += float(reward)
+        self.arm_reward_square_totals[index] += float(reward) ** 2
         self.training_samples += 1
+
+    def training_audit(self) -> dict:
+        by_arm = {}
+        for index, arm in enumerate(self.arms):
+            count = int(self.arm_update_counts[index])
+            mean = (None if count == 0 else
+                    float(self.arm_reward_totals[index] / count))
+            variance = (None if count == 0 else max(
+                0.0,
+                float(self.arm_reward_square_totals[index] / count)
+                - mean ** 2))
+            by_arm[arm] = {
+                "updates": count,
+                "reward_sum": float(self.arm_reward_totals[index]),
+                "reward_mean": mean,
+                "reward_std": (
+                    None if variance is None else math.sqrt(variance)),
+            }
+        return {
+            "reward_attribution": "action_level",
+            "training_samples": self.training_samples,
+            "by_arm": by_arm,
+        }
 
     def save(self, path) -> None:
         save_checkpoint(path, {
@@ -218,6 +280,7 @@ class LinUCBModel:
             "state_dim": len(BANDIT_CONTEXT_FEATURES),
             "action_dim": len(self.arms),
             "context_version": LINUCB_CONTEXT_VERSION,
+            "model_version": LINUCB_MODEL_VERSION,
             "context_features": list(BANDIT_CONTEXT_FEATURES),
             "arms": list(self.arms),
             "alpha": self.alpha,
@@ -225,6 +288,9 @@ class LinUCBModel:
         }, {
             "covariance": self.covariance,
             "reward_sum": self.reward_sum,
+            "arm_update_counts": self.arm_update_counts,
+            "arm_reward_totals": self.arm_reward_totals,
+            "arm_reward_square_totals": self.arm_reward_square_totals,
         })
 
     @classmethod
@@ -233,6 +299,7 @@ class LinUCBModel:
             path, expected_algorithm=LINUCB_ALGORITHM,
             expected_state_dim=len(BANDIT_CONTEXT_FEATURES))
         if (metadata.get("context_version") != LINUCB_CONTEXT_VERSION or
+                metadata.get("model_version") != LINUCB_MODEL_VERSION or
                 tuple(metadata.get("context_features", ())) !=
                 BANDIT_CONTEXT_FEATURES):
             raise ModelValidationError("LinUCB context contract mismatch")
@@ -250,7 +317,9 @@ class LinUCBModel:
                 raise ValueError("invalid alpha or training sample count")
             return cls(
                 arms, float(raw_alpha), arrays["covariance"],
-                arrays["reward_sum"], raw_samples)
+                arrays["reward_sum"], raw_samples,
+                arrays["arm_update_counts"], arrays["arm_reward_totals"],
+                arrays["arm_reward_square_totals"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ModelValidationError(f"invalid LinUCB checkpoint: {exc}") from exc
 
@@ -261,6 +330,28 @@ class LinUCBScheduler(BaseScheduler):
         self.model = LinUCBModel.load(model_path)
         self.arms = {name: _arm_factory(name) for name in self.model.arms}
         self._last_arm = None
+        self._reset_arm_audit()
+
+    def _reset_arm_audit(self):
+        self.arm_selection_counts = {name: 0 for name in self.model.arms}
+        self.arm_commit_counts = {name: 0 for name in self.model.arms}
+        self.arm_failure_reasons = {name: {} for name in self.model.arms}
+
+    def _record_arm_failure(self, arm_name, reason):
+        if arm_name not in self.arm_failure_reasons:
+            return
+        reason = str(reason or "unspecified")
+        counts = self.arm_failure_reasons[arm_name]
+        counts[reason] = counts.get(reason, 0) + 1
+
+    def arm_audit(self):
+        return {
+            "selection_counts": dict(self.arm_selection_counts),
+            "commit_counts": dict(self.arm_commit_counts),
+            "failure_reasons": {
+                name: dict(values)
+                for name, values in self.arm_failure_reasons.items()},
+        }
 
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
         result = self.assign(
@@ -275,14 +366,37 @@ class LinUCBScheduler(BaseScheduler):
                context: Optional[SchedulingContext] = None):
         started = time.perf_counter()
         context = context or SchedulingContext()
+        arm_name = None
         try:
             vector = bandit_context_vector(
                 robot_states, pending_tasks, context)
             arm_name, scores = self.model.select(vector)
+            self.arm_selection_counts[arm_name] += 1
+            visible = _visible_tasks(
+                pending_tasks, context.current_time)
             result = self.arms[arm_name].assign(
-                _visible_tasks(pending_tasks, context.current_time),
-                robot_states, context)
+                visible, robot_states, context)
             self._last_arm = arm_name
+            valid, reason = validate_assignments(
+                result.assignments, visible, robot_states, context)
+            if (not result.is_feasible or not result.assignments or
+                    not valid):
+                failure = (
+                    result.diagnostics.get("reason")
+                    if isinstance(result.diagnostics, dict) else None)
+                failure = failure or reason or "empty_arm_result"
+                self._record_arm_failure(arm_name, failure)
+                return SchedulerResult(
+                    [], None, time.perf_counter()-started, False, self.name,
+                    {
+                        "reason": f"linucb_arm_rejected:{failure}",
+                        "selected_arm": arm_name,
+                        "arm_scores": {
+                            name: float(score)
+                            for name, score in zip(self.model.arms, scores)},
+                        "bandit_context_version": LINUCB_CONTEXT_VERSION,
+                        "arm_audit": self.arm_audit(),
+                    })
             result.algorithm_name = self.name
             result.computation_time = time.perf_counter()-started
             result.diagnostics.update({
@@ -291,6 +405,7 @@ class LinUCBScheduler(BaseScheduler):
                     name: float(score)
                     for name, score in zip(self.model.arms, scores)},
                 "bandit_context_version": LINUCB_CONTEXT_VERSION,
+                "arm_audit": self.arm_audit(),
             })
             if (os.environ.get(
                     "SMART_FACTORY_PHYSICAL_FINE_TUNE", "0"
@@ -310,14 +425,22 @@ class LinUCBScheduler(BaseScheduler):
                 })
             return result
         except Exception as exc:
+            if arm_name is not None:
+                self._record_arm_failure(
+                    arm_name, f"exception:{type(exc).__name__}")
             self._last_arm = None
             return SchedulerResult(
                 [], None, time.perf_counter()-started, False, self.name,
-                {"reason": f"linucb_inference_error:{type(exc).__name__}"})
+                {
+                    "reason": f"linucb_inference_error:{type(exc).__name__}",
+                    "selected_arm": arm_name,
+                    "arm_audit": self.arm_audit(),
+                })
 
     def on_assignment_committed(self, assignment):
         if self._last_arm is not None:
             self.arms[self._last_arm].on_assignment_committed(assignment)
+            self.arm_commit_counts[self._last_arm] += 1
         super().on_assignment_committed(assignment)
 
     def on_assignment_rejected(self, assignment, reason):
@@ -330,6 +453,7 @@ class LinUCBScheduler(BaseScheduler):
         for arm in self.arms.values():
             arm.reset()
         self._last_arm = None
+        self._reset_arm_audit()
 
 
 def _strict_seeds(values: Iterable[int]):
@@ -356,29 +480,32 @@ def _snapshot_arm_rewards(robot_states, tasks, context, arms):
     rewards = {}
     for arm_name in arms:
         scheduler = _arm_factory(arm_name)
-        try:
-            result = scheduler.assign(visible, robot_states, context)
-            selected_cost = 0.0
-            selected_rows = set()
-            selected_columns = set()
-            for assignment in result.assignments if result.is_feasible else ():
-                pair = (row_by_robot[assignment.robot_id],
-                        column_by_task[assignment.task.task_id])
-                if (pair[0] in selected_rows or
-                        pair[1] in selected_columns or
-                        not matrix.feasible[pair]):
-                    raise ValueError("arm returned an invalid matching")
-                selected_rows.add(pair[0])
-                selected_columns.add(pair[1])
-                selected_cost += float(matrix.values[pair])
-            missing = target_count-len(selected_rows)
-            if missing < 0:
-                raise ValueError("arm matching exceeds target cardinality")
-            normalised_cost = (
-                selected_cost+missing*missing_penalty) / target_count
-            rewards[arm_name] = -normalised_cost/30.0
-        except Exception:
-            rewards[arm_name] = -(missing_penalty*2.0)/30.0
+        result = scheduler.assign(visible, robot_states, context)
+        valid, reason = validate_assignments(
+            result.assignments, visible, robot_states, context)
+        if not result.is_feasible or not result.assignments or not valid:
+            raise RuntimeError(
+                f"LinUCB arm {arm_name} failed legality gate: {reason}")
+        selected_cost = 0.0
+        selected_rows = set()
+        selected_columns = set()
+        for assignment in result.assignments:
+            pair = (row_by_robot[assignment.robot_id],
+                    column_by_task[assignment.task.task_id])
+            if (pair[0] in selected_rows or
+                    pair[1] in selected_columns or
+                    not matrix.feasible[pair]):
+                raise RuntimeError(
+                    f"LinUCB arm {arm_name} returned an invalid matching")
+            selected_rows.add(pair[0])
+            selected_columns.add(pair[1])
+            selected_cost += float(matrix.values[pair])
+        missing = target_count-len(selected_rows)
+        if missing < 0:
+            raise RuntimeError("arm matching exceeds target cardinality")
+        normalised_cost = (
+            selected_cost+missing*missing_penalty) / target_count
+        rewards[arm_name] = -normalised_cost/30.0
     return rewards
 
 
@@ -405,8 +532,11 @@ def train_linucb(snapshot_seeds: Iterable[int], *, alpha: float = 0.5,
         "snapshot_seeds": used_seeds,
         "snapshots": len(used_seeds),
         "updates": model.training_samples,
+        "reward_attribution": "snapshot_action_level_full_information",
+        "arm_legality_failures": {arm: 0 for arm in model.arms},
         "mean_reward_by_arm": {
             arm: float(np.mean(values))
             for arm, values in reward_history.items()},
+        "training_audit": model.training_audit(),
     }
     return model, report

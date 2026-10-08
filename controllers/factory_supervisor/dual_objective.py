@@ -1,5 +1,6 @@
 """Versioned Count and Utility V2 evaluation for fixed-horizon runs."""
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -677,6 +678,259 @@ class UtilityV2RewardProfile:
             **components,
             "reward_total": total,
         }
+
+
+def _reset_reward_cursors(task: TransportTask) -> None:
+    """Reset only derived reward/event cursors on an isolated task copy."""
+    task.dispatch_reward_emitted = False
+    task.completion_reward_emitted = False
+    task.terminal_loss_emitted = False
+    task.deadline_penalty_rewarded = False
+    task.deadline_severity_rewarded = False
+    task.rewarded_excess_distance_cursor = 0.0
+    if task.ideal_distance is not None:
+        task.excess_distance_cursor = max(
+            0.0, task.actual_distance - task.ideal_distance)
+    if task.priority in (2, 3):
+        # Reconstruct deadline facts from final immutable timestamps instead
+        # of depending on whether a runtime emitted them earlier.
+        task.deadline_missed = False
+        task.deadline_missed_at = None
+        task.deadline_penalty_emitted = False
+        task.deadline_severity_emitted = False
+        task.deadline_tardiness_seconds = None
+        task.completed_on_time = None
+
+
+def physical_episode_reward_attribution(
+        tasks: Iterable[TransportTask], rollout_actions: Iterable[object], *,
+        objective: str,
+        utility_profile: Optional[UtilityV2RewardProfile] = None,
+        collision_count: int = 0,
+        horizon_seconds: float = 1800.0) -> dict:
+    """Attribute an audited physical episode return to committed actions.
+
+    Each task's complete lifecycle reward belongs to its latest committed
+    rollout action.  Rewards for tasks with no committed action, plus global
+    collision penalties, are reported as a shared pool and divided equally
+    across actions.  Input task objects are never mutated.
+    """
+    if objective not in {"count", "utility_v2"}:
+        raise ValueError("objective must be count or utility_v2")
+    horizon = _finite(
+        horizon_seconds, "horizon_seconds", positive=True)
+    task_rows = list(tasks)
+    task_by_id = _reward_task_index(task_rows)
+    snapshots = _task_snapshot(task_rows, horizon)
+    try:
+        action_rows = list(rollout_actions)
+    except TypeError as exc:
+        raise ValueError("rollout_actions must be iterable") from exc
+    if not action_rows:
+        raise ValueError("physical reward attribution requires an action")
+    normalized_actions = []
+    for action in action_rows:
+        if isinstance(action, Mapping):
+            task_id = action.get("task_id")
+            committed_at = action.get("committed_at")
+            ideal_distance = action.get("ideal_distance")
+        else:
+            task_id = action
+            committed_at = None
+            ideal_distance = None
+        if (isinstance(task_id, bool) or not isinstance(task_id, int) or
+                task_id not in task_by_id):
+            raise ValueError("rollout action references an unknown task")
+        task = task_by_id[task_id]
+        if committed_at is not None:
+            committed_at = _finite(
+                committed_at, "rollout committed_at", nonnegative=True)
+            if committed_at < task.arrival_time or committed_at > horizon:
+                raise ValueError("rollout commit lies outside the task horizon")
+        elif task.assignment_time is None:
+            raise ValueError(
+                "historical rollout action requires committed_at")
+        if ideal_distance is not None:
+            ideal_distance = _finite(
+                ideal_distance, "rollout ideal_distance", nonnegative=True)
+        normalized_actions.append({
+            "task_id": task_id,
+            "committed_at": committed_at,
+            "ideal_distance": ideal_distance,
+        })
+    if (isinstance(collision_count, bool) or
+            not isinstance(collision_count, int) or collision_count < 0):
+        raise ValueError("collision_count must be a non-negative integer")
+
+    owner_by_task_id = {
+        action["task_id"]: index
+        for index, action in enumerate(normalized_actions)
+    }
+    latest_action_by_task_id = {
+        action["task_id"]: action for action in normalized_actions
+    }
+    task_rewards = [0.0] * len(normalized_actions)
+    shared_total = 0.0
+    task_reward_by_id = {}
+
+    if objective == "count":
+        components = {"reward_completion": 0.0}
+        for snapshot in snapshots:
+            reward = 1.0 if snapshot["complete"] else 0.0
+            task_id = snapshot["task_id"]
+            task_reward_by_id[str(task_id)] = reward
+            owner = owner_by_task_id.get(task_id)
+            if owner is None:
+                shared_total += reward
+            else:
+                task_rewards[owner] += reward
+            components["reward_completion"] += reward
+        profile_version = "count_reward_v1"
+        profile_hash = CountRewardProfile(
+            horizon_seconds=horizon).sha256
+    else:
+        if not isinstance(utility_profile, UtilityV2RewardProfile):
+            raise ValueError("utility_v2 attribution requires its reward profile")
+        if utility_profile.horizon_seconds != horizon:
+            raise ValueError("Utility reward horizon differs from attribution")
+        if utility_profile.safety_observation != "webots_physical":
+            raise ValueError(
+                "physical Utility attribution requires Webots safety observation")
+        components = {name: 0.0 for name in REWARD_COMPONENT_NAMES}
+        for task in task_rows:
+            if not task.arrival_time < horizon:
+                continue
+            clone = deepcopy(task)
+            latest_action = latest_action_by_task_id.get(task.task_id)
+            if latest_action is not None:
+                if latest_action["committed_at"] is not None:
+                    clone.assignment_time = latest_action["committed_at"]
+                if latest_action["ideal_distance"] is not None:
+                    clone.ideal_distance = latest_action["ideal_distance"]
+            _reset_reward_cursors(clone)
+            rows = []
+            if clone.assignment_time is not None:
+                rows.append(utility_profile.transition(
+                    [clone], [], dispatch_task=clone,
+                    horizon_seconds=horizon, runtime_mode="webots"))
+            events = []
+            if clone.status == TaskStatus.COMPLETED:
+                events.append({
+                    "type": "task_completed",
+                    "task_id": int(clone.task_id),
+                })
+            events.extend(clone.deadline_events(
+                horizon, horizon_seconds=horizon, final=True))
+            events.append({
+                "type": "episode_horizon",
+                "current_time": horizon,
+            })
+            rows.append(utility_profile.transition(
+                [clone], events, horizon_seconds=horizon,
+                runtime_mode="webots"))
+            reward = float(sum(row["reward_total"] for row in rows))
+            task_reward_by_id[str(task.task_id)] = reward
+            owner = owner_by_task_id.get(task.task_id)
+            if owner is None:
+                shared_total += reward
+            else:
+                task_rewards[owner] += reward
+            for name in REWARD_COMPONENT_NAMES:
+                components[name] += sum(
+                    float(row[name]) for row in rows
+                    if row[name] is not None)
+
+        if collision_count:
+            collision_row = utility_profile.transition(
+                [], ({"type": "physical_collision"}
+                     for _ in range(collision_count)),
+                horizon_seconds=horizon, runtime_mode="webots")
+            shared_total += float(collision_row["reward_total"])
+            for name in REWARD_COMPONENT_NAMES:
+                if collision_row[name] is not None:
+                    components[name] += float(collision_row[name])
+        profile_version = utility_profile.version
+        profile_hash = utility_profile.sha256
+
+    shared_rewards = [shared_total / len(normalized_actions)] * len(
+        normalized_actions)
+    shared_rewards[-1] += shared_total - sum(shared_rewards)
+    row_rewards = [
+        float(task_reward + shared_reward)
+        for task_reward, shared_reward in zip(task_rewards, shared_rewards)
+    ]
+    reward_total = float(sum(components.values()))
+    if not math.isclose(
+            sum(row_rewards), reward_total, rel_tol=0.0, abs_tol=1e-9):
+        raise RuntimeError("physical action rewards do not conserve episode return")
+    return {
+        "attribution_version": "physical_action_reward_v1",
+        "objective": objective,
+        "reward_profile_version": profile_version,
+        "reward_profile_hash": profile_hash,
+        "action_task_ids": [
+            action["task_id"] for action in normalized_actions],
+        "row_rewards": row_rewards,
+        "row_task_rewards": task_rewards,
+        "row_shared_rewards": shared_rewards,
+        "task_reward_by_id": task_reward_by_id,
+        "shared_reward_total": shared_total,
+        "reward_audit": {
+            "reward_profile_version": profile_version,
+            "reward_profile_hash": profile_hash,
+            **components,
+            "reward_total": reward_total,
+        },
+    }
+
+
+def apply_physical_action_rewards(rollout_steps: Iterable[Mapping],
+                                  attribution: Mapping) -> list:
+    """Attach a verified attribution result to immutable rollout rows."""
+    try:
+        source_rows = list(rollout_steps)
+    except TypeError as exc:
+        raise ValueError("rollout_steps must be iterable") from exc
+    if not source_rows or any(not isinstance(row, Mapping)
+                              for row in source_rows):
+        raise ValueError("rollout_steps must contain mappings")
+    if not isinstance(attribution, Mapping):
+        raise ValueError("attribution must be a mapping")
+    action_task_ids = attribution.get("action_task_ids")
+    rewards = attribution.get("row_rewards")
+    task_rewards = attribution.get("row_task_rewards")
+    shared_rewards = attribution.get("row_shared_rewards")
+    values = (action_task_ids, rewards, task_rewards, shared_rewards)
+    if any(not isinstance(value, list) or len(value) != len(source_rows)
+           for value in values):
+        raise ValueError("attribution row count differs from rollout")
+    result = []
+    for index, source in enumerate(source_rows):
+        if source.get("task_id") != action_task_ids[index]:
+            raise ValueError("attribution action order differs from rollout")
+        numeric = []
+        for value in (rewards[index], task_rewards[index],
+                      shared_rewards[index]):
+            numeric.append(_finite(value, "action reward"))
+        if not math.isclose(
+                numeric[0], numeric[1] + numeric[2],
+                rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("action reward components do not sum")
+        row = dict(source)
+        row.update({
+            "reward": numeric[0],
+            "task_reward": numeric[1],
+            "shared_reward": numeric[2],
+            "done": index == len(source_rows) - 1,
+        })
+        result.append(row)
+    expected = attribution.get("reward_audit", {}).get("reward_total")
+    expected = _finite(expected, "attributed episode reward")
+    if not math.isclose(
+            sum(row["reward"] for row in result), expected,
+            rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("rollout rewards do not conserve episode return")
+    return result
 
 
 def _percentile95(values) -> Optional[float]:

@@ -76,7 +76,7 @@ def train_online_value_agent(agent, episode_seeds: Iterable[int], *,
     if (not np.all(np.isfinite(returns)) or
             (losses and not np.all(np.isfinite(losses)))):
         raise ValueError("training produced non-finite metrics")
-    return {
+    report = {
         "episode_seeds": list(seeds),
         "episodes": len(seeds),
         "steps": steps,
@@ -85,6 +85,10 @@ def train_online_value_agent(agent, episode_seeds: Iterable[int], *,
         "mean_loss": float(np.mean(losses)) if losses else None,
         "runtime": summarize_runtime_telemetry(runtime_rows),
     }
+    projection_audit = getattr(agent, "projection_audit", None)
+    if callable(projection_audit):
+        report["projection_audit"] = projection_audit()
+    return report
 
 
 def _cost_greedy_action(environment: SchedulingEnvironment,
@@ -132,7 +136,7 @@ def collect_cql_dataset(episode_seeds: Iterable[int], *,
             next_mask = environment.get_action_mask()
             rows.append((
                 state.copy(), mask.copy(), action, float(reward),
-                next_state.copy(), next_mask.copy(), done))
+                next_state.copy(), next_mask.copy(), done, seed))
             state = next_state
             if done:
                 break
@@ -146,4 +150,5 @@ def collect_cql_dataset(episode_seeds: Iterable[int], *,
         np.stack([row[4] for row in rows]),
         np.stack([row[5] for row in rows]),
         np.asarray([row[6] for row in rows], dtype=bool),
-        "MaskedCostGreedy", seeds)
+        "MaskedCostGreedy/v1", seeds,
+        np.asarray([row[7] for row in rows], dtype=np.int64))

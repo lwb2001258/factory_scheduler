@@ -1,6 +1,6 @@
 """Deterministic contracts and execution primitives for dual-objective tuning."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import itertools
 import json
@@ -17,13 +17,15 @@ import numpy as np
 
 from dual_objective import (
     CountRewardProfile, UtilityScoreConfig, UtilityV2RewardProfile,
-    count_evaluation, paired_count_delta, utility_v2_evaluation,
+    count_evaluation, paired_count_delta,
+    physical_episode_reward_attribution, utility_v2_evaluation,
 )
 from graph_ppo_scheduler import (
     GraphPPOConfig, GraphPPOModel, GraphRolloutStep, graph_policy_inputs,
 )
 from headless_training_runtime import (
-    HeadlessRuntimeConfig, summarize_runtime_telemetry,
+    HEADLESS_DYNAMICS_VERSION, HeadlessRuntimeConfig,
+    summarize_runtime_telemetry,
 )
 from rl_environment import RLEnvironmentConfig, SchedulingEnvironment
 from schedulers import create_scheduler
@@ -529,7 +531,7 @@ def train_objective_graph_ppo(
             raise RuntimeError("training reward profile was not installed")
 
         rollout = []
-        pending_reward = 0.0
+        action_rows = []
         episode_return = 0.0
         terminated = False
         for _step_index in range(episode_step_limit):
@@ -545,22 +547,28 @@ def train_objective_graph_ppo(
                 _state, reward, terminated, truncated, info = (
                     environment.step(environment.no_op_action))
                 del _state
-                pending_reward += float(reward)
             else:
                 edge_index, log_probability, value = model.sample_edge(
                     features)
                 row, column = coordinates[edge_index]
+                task = matrix.tasks[int(column)]
                 action = environment.action_for_pair(
                     matrix.robot_ids[int(row)],
-                    matrix.tasks[int(column)].task_id)
+                    task.task_id)
                 _state, reward, terminated, truncated, info = (
                     environment.step(action))
                 del _state
                 rollout.append(GraphRolloutStep(
                     features.copy(), edge_index, log_probability, value,
-                    pending_reward + float(reward), False))
-                pending_reward = 0.0
+                    0.0, False))
+                action_rows.append({
+                    "task_id": int(task.task_id),
+                    "committed_at": max(
+                        float(live_context.current_time),
+                        float(task.arrival_time)),
+                })
                 decision_count += 1
+            episode_return += float(reward)
             if (info.get("invalid_action") or
                     info.get("assignment_rejected") or
                     info.get("invalid_truncation")):
@@ -570,17 +578,29 @@ def train_objective_graph_ppo(
                 raise RuntimeError(
                     "objective training truncated before clean termination")
             if terminated:
-                if rollout:
-                    rollout[-1].reward += pending_reward
-                    rollout[-1].done = True
-                    pending_reward = 0.0
                 break
         if not terminated:
             raise RuntimeError("objective training did not reach the horizon")
         if not rollout:
             raise RuntimeError("objective training episode had no decisions")
-        if pending_reward != 0.0:
-            raise RuntimeError("terminal reward was not attributed to rollout")
+        attribution_profile = None
+        if objective == "utility_v2":
+            attribution_profile = replace(
+                profile, safety_observation="webots_physical")
+        attribution = physical_episode_reward_attribution(
+            environment._tasks, action_rows, objective=objective,
+            utility_profile=attribution_profile, collision_count=0,
+            horizon_seconds=duration)
+        action_rewards = attribution["row_rewards"]
+        if (len(action_rewards) != len(rollout) or not math.isclose(
+                sum(action_rewards), episode_return,
+                rel_tol=0.0, abs_tol=1e-9)):
+            raise RuntimeError(
+                "GraphPPO lifecycle rewards do not conserve episode return")
+        for index, (step, action_reward) in enumerate(zip(
+                rollout, action_rewards)):
+            step.reward = float(action_reward)
+            step.done = index == len(rollout)-1
         update = model.update(rollout)
         if update["mean_loss"] is None:
             raise RuntimeError("objective training produced no optimizer update")
@@ -588,7 +608,11 @@ def train_objective_graph_ppo(
             raise RuntimeError("objective training loss is non-finite")
         losses.append(float(update["mean_loss"]))
         update_count += int(update["updates"])
-        episode_return = float(sum(step.reward for step in rollout))
+        attributed_return = float(sum(step.reward for step in rollout))
+        if not math.isclose(
+                attributed_return, episode_return,
+                rel_tol=0.0, abs_tol=1e-9):
+            raise RuntimeError("GraphPPO attributed return drifted")
         if not math.isfinite(episode_return):
             raise RuntimeError("objective training return is non-finite")
         episode_returns.append(episode_return)
@@ -599,6 +623,13 @@ def train_objective_graph_ppo(
             raise RuntimeError("training runtime changed the task manifest")
         runtime = environment.runtime_telemetry()
         if not (
+                runtime.get("runtime_mode") == "headless_webots_logic" and
+                runtime.get("dynamics_version") ==
+                    HEADLESS_DYNAMICS_VERSION and
+                runtime.get("physics_fidelity") == "business_logic_only" and
+                runtime.get("joint_runtime") is True and
+                runtime.get("route_planner") == "rolling_joint_grid" and
+                runtime.get("fixed_horizon") is True and
                 runtime.get("horizon_finalized") and
                 runtime.get("termination_reason") == "episode_horizon" and
                 runtime.get("current_time") == duration and
@@ -626,6 +657,8 @@ def train_objective_graph_ppo(
         raise RuntimeError("objective training produced non-finite metrics")
     return {
         "objective": objective,
+        "reward_attribution": "task_lifecycle_action_level",
+        "reward_conservation_verified": True,
         "episode_keys": [list(key) for key in canonical_keys],
         "episodes": len(canonical_keys),
         "decisions": decision_count,
@@ -999,6 +1032,12 @@ def _run_validation_episode(*, scheduler_name: str, model_path,
         actual_task_hash == manifest["task_manifest_sha256"] and
         metadata["reward_profile_hash"] == profile.sha256 and
         runtime.get("reward_profile_hash") == profile.sha256 and
+        runtime.get("runtime_mode") == "headless_webots_logic" and
+        runtime.get("dynamics_version") == HEADLESS_DYNAMICS_VERSION and
+        runtime.get("physics_fidelity") == "business_logic_only" and
+        runtime.get("joint_runtime") is True and
+        runtime.get("route_planner") == "rolling_joint_grid" and
+        runtime.get("fixed_horizon") is True and
         runtime.get("horizon_finalized") and
         runtime.get("termination_reason") == "episode_horizon" and
         runtime.get("current_time") == duration_seconds and

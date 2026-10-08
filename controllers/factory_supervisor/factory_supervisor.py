@@ -74,14 +74,17 @@ from schedulers import (
     NearestNeighbourScheduler,
     Assignment, SchedulingContext, SchedulerResult,
 )
-from learning_scheduler import attach_learning_trace
+from learning_scheduler import (
+    attach_learning_trace, physical_supervision_snapshot,
+)
 from startup_gate import StartupGate
 from metrics_collector import MetricsCollector, SafetyEvent
 from joint_plan_transaction import JointPlanTransaction
 from training_scenarios import formal_scenario_config
 from dual_objective import (
     UtilityScoreConfig, UtilityV2RewardProfile, count_evaluation,
-    utility_v2_evaluation,
+    utility_v2_evaluation, apply_physical_action_rewards,
+    physical_episode_reward_attribution,
 )
 
 
@@ -2395,7 +2398,11 @@ class FactorySupervisor:
         )
         self.motion_coordinator = MotionCoordinator(num_active_robots=self.num_robots)
         self.scheduler = create_scheduler(
-            scheduler_type, model_path, seed=seed, allow_safe_fallback=True)
+            scheduler_type, model_path, seed=seed,
+            # Canonical-manifest training/evaluation is fail-closed.  A
+            # missing or incompatible AI checkpoint must never be relabelled
+            # as that AI while actually running Hungarian/legacy PPO.
+            allow_safe_fallback=not bool(manifest_path))
         self.safe_schedulers = [
             HungarianScheduler(), GreedyScheduler(),
             NearestNeighbourScheduler()]
@@ -2677,7 +2684,8 @@ class FactorySupervisor:
                     "utility reward horizon differs from Webots duration")
         return config, reward_profile
 
-    def _record_committed_physical_rollout(self, decision, assignment):
+    def _record_committed_physical_rollout(
+            self, decision, assignment, shared_supervision):
         """Retain one on-policy action only after physical dispatch commit."""
         if not self._physical_fine_tune_enabled:
             return
@@ -2691,6 +2699,9 @@ class FactorySupervisor:
         if (step.get("selected_robot_id") != assignment.robot_id or
                 step.get("selected_task_id") != assignment.task.task_id):
             raise RuntimeError("physical rollout action differs from commit")
+        if not isinstance(shared_supervision, dict):
+            raise RuntimeError(
+                "physical fine tune missed shared supervision telemetry")
         row = dict(step)
         row.update({
             "reward": 0.0,
@@ -2698,6 +2709,8 @@ class FactorySupervisor:
             "committed_at": float(self.sim_time),
             "robot_id": int(assignment.robot_id),
             "task_id": int(assignment.task.task_id),
+            "ideal_distance": float(assignment.task.ideal_distance),
+            "shared_supervision": shared_supervision,
         })
         self._physical_rollout_steps.append(row)
 
@@ -2735,73 +2748,21 @@ class FactorySupervisor:
             if not self._physical_rollout_steps:
                 raise RuntimeError(
                     "physical fine tune episode has no committed policy steps")
-            if objective == "count":
-                reward = float(count_score["total_tasks_completed"])
-                reward_audit = {
-                    "reward_profile_version": "count_reward_v1",
-                    "reward_total": reward,
-                }
-            else:
-                if self._utility_reward_profile is None:
-                    raise RuntimeError(
-                        "utility fine tune requires a reward profile")
-                profile = self._utility_reward_profile
-                reward_rows = []
-                # With gamma=1, accumulating these physical facts at the
-                # terminal boundary is return-equivalent to online emission
-                # and avoids changing controller timing during Webots runs.
-                for task in tasks:
-                    if task.assignment_time is not None:
-                        reward_rows.append(profile.transition(
-                            tasks, [], dispatch_task=task,
-                            horizon_seconds=float(SIM_DURATION),
-                            runtime_mode="webots"))
-                terminal_events = []
-                for task in tasks:
-                    if task.status == TaskStatus.COMPLETED:
-                        terminal_events.append({
-                            "type": "task_completed",
-                            "task_id": int(task.task_id),
-                        })
-                    terminal_events.extend(task.deadline_events(
-                        self.sim_time,
-                        horizon_seconds=float(SIM_DURATION), final=True))
-                    if task.ideal_distance is not None:
-                        task.excess_distance_cursor = max(
-                            0.0, task.actual_distance - task.ideal_distance)
-                terminal_events.extend(
-                    {"type": "physical_collision"}
-                    for _ in range(self.metrics.physical_collision_count))
-                terminal_events.append({
-                    "type": "episode_horizon",
-                    "current_time": float(SIM_DURATION),
-                })
-                reward_rows.append(profile.transition(
-                    tasks, terminal_events,
-                    horizon_seconds=float(SIM_DURATION),
-                    runtime_mode="webots"))
-                reward = float(sum(
-                    row["reward_total"] for row in reward_rows))
-                component_names = (
-                    "reward_dispatch", "reward_completion",
-                    "reward_terminal_loss", "reward_route_excess",
-                    "reward_deadline_base", "reward_deadline_severity",
-                    "reward_invalid", "reward_defer", "reward_collision",
-                    "reward_proximity")
-                reward_audit = {
-                    "reward_profile_version": profile.version,
-                    "reward_profile_hash": profile.sha256,
-                    **{
-                        name: sum(
-                            float(row[name]) for row in reward_rows
-                            if row[name] is not None)
-                        for name in component_names
-                    },
-                    "reward_total": reward,
-                }
-            rollout = [dict(step) for step in self._physical_rollout_steps]
-            rollout[-1]["reward"] = reward
-            rollout[-1]["done"] = True
+            if objective == "utility_v2" and self._utility_reward_profile is None:
+                raise RuntimeError(
+                    "utility fine tune requires a reward profile")
+            attribution = physical_episode_reward_attribution(
+                tasks,
+                self._physical_rollout_steps,
+                objective=objective,
+                utility_profile=self._utility_reward_profile,
+                collision_count=self.metrics.physical_collision_count,
+                horizon_seconds=float(SIM_DURATION),
+            )
+            reward_audit = attribution["reward_audit"]
+            reward = float(reward_audit["reward_total"])
+            rollout = apply_physical_action_rewards(
+                self._physical_rollout_steps, attribution)
             result["physical_fine_tune"] = {
                 "status": "complete",
                 "algorithm": os.environ.get(
@@ -2810,6 +2771,12 @@ class FactorySupervisor:
                 "objective": objective,
                 "episode_return": reward,
                 "reward_audit": reward_audit,
+                "reward_attribution_version": attribution[
+                    "attribution_version"],
+                "shared_reward_total": attribution[
+                    "shared_reward_total"],
+                "task_reward_by_id": attribution[
+                    "task_reward_by_id"],
                 "rollout_step_count": len(rollout),
                 "rollout": rollout,
             }
@@ -6427,7 +6394,10 @@ class FactorySupervisor:
                 path_cost_provider=self._runtime_path_cost_provider(
                     robot_states),
                 failed_pairs=frozenset(self._failed_assignment_pairs),
-                configuration={"runtime_geometry": "factory-grid-astar-v3"},
+                configuration={
+                    "runtime_geometry": "factory-grid-astar-v3",
+                    "episode_end_time": float(SIM_DURATION),
+                },
             )
             try:
                 decision = self.scheduler.assign(pending, robot_states, context)
@@ -6445,7 +6415,11 @@ class FactorySupervisor:
             # assignment internally.  Count and attribute that decision as a
             # fallback instead of silently reporting it as native RL work.
             if decision.diagnostics.get("fallback", False):
-                self.metrics.record_scheduler_fallback(invalid_output=False)
+                self.metrics.record_scheduler_fallback(
+                    invalid_output=False,
+                    reason=decision.diagnostics.get(
+                        "rl_failure",
+                        decision.diagnostics.get("reason", "unspecified")))
             if not decision.is_feasible or not decision.assignments:
                 reason = decision.diagnostics.get("reason", "")
                 if self._physical_fine_tune_enabled:
@@ -6457,7 +6431,8 @@ class FactorySupervisor:
                     raise RuntimeError(
                         "physical fine tune policy failed: " + str(reason))
                 self.metrics.record_scheduler_fallback(
-                    invalid_output=reason not in SCHEDULER_WAIT_REASONS)
+                    invalid_output=reason not in SCHEDULER_WAIT_REASONS,
+                    reason=reason)
                 print(f"[T={self.sim_time:.1f}] Scheduler {self.scheduler.name} "
                       f"rejected: {decision.diagnostics.get('reason')}; "
                       "trying safe fallback chain")
@@ -6481,6 +6456,14 @@ class FactorySupervisor:
                 break
 
             assignment = decision.assignments[0]
+            decision_algorithm = (
+                decision.algorithm_name or active_scheduler.name)
+            self.metrics.record_scheduler_solution(
+                decision_algorithm,
+                proposed_pair_count=len(decision.assignments),
+                objective_value=decision.objective_value,
+                first_assignment_estimated_cost=assignment.estimated_cost,
+            )
             robot_id, task = assignment.robot_id, assignment.task
             
             robot = self.robots[robot_id]
@@ -6491,24 +6474,50 @@ class FactorySupervisor:
             # task and its state was reset.
             self._get_robot_positions_from_webots()
 
+            # A robot can become idle at the next task's pickup dock.  The
+            # motion planner intentionally rejects a zero-displacement route,
+            # so dispatch directly toward delivery when pickup is already
+            # physically satisfied instead of misclassifying it as
+            # unreachable.
+            pickup_distance = math.hypot(
+                robot.position[0] - task.pickup_position[0],
+                robot.position[1] - task.pickup_position[1])
+            pickup_already_reached = (
+                pickup_distance <= GOAL_TOLERANCE * 2.5)
+            route_goal = (task.delivery_location if pickup_already_reached
+                          else task.pickup_location)
+
             # Plan path via lifelong CBS (avoids other robots' reservations);
             # fall back to per-robot A* if no conflict-free plan exists.
             pickup_path = self.motion_coordinator.plan_grid_lifelong(
-                robot_id, robot.position, task.pickup_location)
+                robot_id, robot.position, route_goal)
             if pickup_path is None:
                 self.motion_coordinator.robot_priorities[robot_id] = -float(
                     getattr(task, 'priority', 0.0) or 0.0)
                 pickup_path = self.motion_coordinator.plan_path_for_robot(
-                    robot_id, robot.position, task.pickup_location)
+                    robot_id, robot.position, route_goal)
             
             if pickup_path:
+                shared_supervision = None
+                if self._physical_fine_tune_enabled:
+                    # Read-only supervision is captured from the same
+                    # pre-commit snapshot seen by the scheduler.  It does not
+                    # alter the chosen pair, route or robot command.
+                    shared_supervision = physical_supervision_snapshot(
+                        assignment, robot_states, pending, context)
                 # Commit task and robot state only after a usable plan exists.
-                task.status = TaskStatus.ASSIGNED
+                task.status = (TaskStatus.IN_PROGRESS
+                               if pickup_already_reached else
+                               TaskStatus.ASSIGNED)
                 task.assigned_robot = robot_id
                 task.assignment_time = self.sim_time
+                task.pickup_time = (self.sim_time
+                                    if pickup_already_reached else None)
                 robot.current_task = task
-                robot.state = RobotState.EN_ROUTE_PICKUP
-                robot.goal_location = task.pickup_location
+                robot.state = (RobotState.EN_ROUTE_DELIVERY
+                               if pickup_already_reached else
+                               RobotState.EN_ROUTE_PICKUP)
+                robot.goal_location = route_goal
                 robot._last_progress_pos = robot.position
                 robot._last_progress_time = self.sim_time
                 self.motion_coordinator.release_home(robot_id)
@@ -6521,6 +6530,7 @@ class FactorySupervisor:
                     task.status = TaskStatus.PENDING
                     task.assigned_robot = None
                     task.assignment_time = None
+                    task.pickup_time = None
                     robot.current_task = None
                     robot.state = RobotState.IDLE
                     robot.goal_location = None
@@ -6530,6 +6540,10 @@ class FactorySupervisor:
                     robot.dispatch_not_before = 0.0
                     active_scheduler.on_assignment_rejected(
                         assignment, "command_send_failed")
+                    self.metrics.record_scheduler_failure(
+                        "command_send_failed")
+                    self.metrics.record_first_assignment_outcome(
+                        decision_algorithm, committed=False)
                     self._failed_assignment_pairs[
                         (robot_id, task.task_id)
                     ] = self.sim_time + ASSIGNMENT_FAILURE_TTL
@@ -6550,22 +6564,31 @@ class FactorySupervisor:
                 task.rewarded_excess_distance_cursor = 0.0
                 active_scheduler.on_assignment_committed(assignment)
                 self._record_committed_physical_rollout(
-                    decision, assignment)
+                    decision, assignment, shared_supervision)
                 attach_learning_trace(
                     task, assignment, robot_states, pending, context,
                     decision.algorithm_name or active_scheduler.name)
                 self.metrics.record_scheduler_commit(
-                    decision.algorithm_name or active_scheduler.name,
+                    decision_algorithm,
                     native=(active_scheduler is self.scheduler and
                             not decision.diagnostics.get("fallback", False)))
+                self.metrics.record_first_assignment_outcome(
+                    decision_algorithm, committed=True)
                 self.initial_dispatch_triggered = True
                 self._failed_assignment_pairs.pop(
                     (robot_id, task.task_id), None)
+                mode = ("pickup already reached; delivery dispatched"
+                        if pickup_already_reached else "pickup dispatched")
                 print(f"[T={self.sim_time:.1f}] Assigned task {task.task_id} to robot "
-                      f"{robot_id}: {task.pickup_location} -> {task.delivery_location}")
+                      f"{robot_id}: {task.pickup_location} -> "
+                      f"{task.delivery_location} ({mode})")
             else:
                 active_scheduler.on_assignment_rejected(
                     assignment, "pickup_path_unreachable")
+                self.metrics.record_scheduler_failure(
+                    "pickup_path_unreachable")
+                self.metrics.record_first_assignment_outcome(
+                    decision_algorithm, committed=False)
                 self._failed_assignment_pairs[
                     (robot_id, task.task_id)
                 ] = self.sim_time + ASSIGNMENT_FAILURE_TTL

@@ -16,7 +16,10 @@ from schedulers import (
     validate_assignments,
 )
 from task_generator import TransportTask
-from dual_objective import CountRewardProfile, UtilityV2RewardProfile
+from dual_objective import (
+    CountRewardProfile, UtilityScoreConfig, UtilityV2RewardProfile,
+    utility_v2_evaluation,
+)
 
 
 ENVIRONMENT_VERSION = RL_ENVIRONMENT_VERSION
@@ -171,7 +174,10 @@ class SchedulingEnvironment:
             (task for task in self._tasks
              if task.status == TaskStatus.PENDING
              and float(task.arrival_time) <= now + 1e-9),
-            key=lambda task: (task.task_id, task.arrival_time)
+            # Under overload, retain urgent work first; within one priority,
+            # the oldest waiting task wins and task_id breaks exact ties.
+            key=lambda task: (
+                -int(task.priority), float(task.arrival_time), task.task_id)
         )[:self.config.max_tasks]
 
     def encode_action(self, robot_slot: int, task_slot: int) -> int:
@@ -326,7 +332,8 @@ class SchedulingEnvironment:
                     dx / cfg.position_scale_x, dy / cfg.position_scale_y,
                     np.clip(float(task.priority) / 2.0, 0, 10),
                     min(wait / cfg.time_scale, 10),
-                    float(task.status == TaskStatus.PENDING),
+                    float(task.is_horizon_limited(
+                        self.runtime_config.episode_end_time)),
                     feasible_fraction,
                     min(expected / cfg.distance_scale, 10),
                 ])
@@ -565,6 +572,38 @@ class SchedulingEnvironment:
             result["reward_profile_version"] = "legacy_reward"
             result["reward_profile_hash"] = None
         return result
+
+    def formal_utility_evaluation(self, config: UtilityScoreConfig) -> dict:
+        """Score the immutable-at-horizon task state with Utility V2.
+
+        This deliberately refuses partial episodes.  Hyper-parameter search
+        must not rank a short rollout or training return as though it were the
+        registered 1800-second Utility score.
+        """
+        if not isinstance(config, UtilityScoreConfig):
+            raise ValueError("config must be UtilityScoreConfig")
+        if self._runtime is None or self.simulation_mode != "headless":
+            raise RuntimeError(
+                "formal Utility evaluation requires a headless episode")
+        runtime = self._runtime.telemetry_snapshot()
+        if (not runtime.get("horizon_finalized") or
+                runtime.get("termination_reason") != "episode_horizon"):
+            raise RuntimeError(
+                "formal Utility evaluation requires a finalized horizon")
+        if not np.isclose(
+                config.horizon_seconds,
+                self.runtime_config.episode_end_time,
+                rtol=0.0, atol=1e-9):
+            raise ValueError("Utility score and runtime horizons differ")
+        route_distances = {
+            task.task_id: {
+                "ideal_distance": task.ideal_distance,
+                "actual_distance": task.actual_distance,
+            }
+            for task in self._tasks if task.assignment_time is not None
+        }
+        return utility_v2_evaluation(
+            self._tasks, config, route_distances=route_distances)
 
     def step_scheduler(self, scheduler):
         """Execute one decision from any project ``BaseScheduler``.

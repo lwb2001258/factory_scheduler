@@ -1,9 +1,10 @@
-"""Graph-PPO task assignment with Hungarian deployment decoding.
+"""Graph-PPO task assignment over variable feasible bipartite edges.
 
 Physical fine tuning is opt-in.  Normal deployment remains deterministic and
-uses the Hungarian decoder; a Webots collection run samples one feasible edge
-and emits the complete on-policy observation in scheduler diagnostics.  The
-supervisor persists that observation only after the physical dispatch commits.
+selects the highest-probability edge from the same action space used during
+training; a Webots collection run samples one edge and emits the complete
+on-policy observation in scheduler diagnostics.  The supervisor persists that
+observation only after the physical dispatch commits.
 """
 
 import math
@@ -19,7 +20,6 @@ from advanced_rl_agents import Adam
 from config import RL_ENVIRONMENT_VERSION
 from learning_scheduler import (
     GRAPH_FEATURE_NAMES, graph_edge_feature_tensor, pair_feature_tensor,
-    solve_hungarian,
 )
 from rl_environment import RLEnvironmentConfig, SchedulingEnvironment
 from headless_training_runtime import summarize_runtime_telemetry
@@ -60,6 +60,7 @@ class GraphPPOConfig:
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
     max_grad_norm: float = 5.0
+    value_huber_delta: float = 10.0
 
     def __post_init__(self):
         _check_integer("hidden_size", self.hidden_size)
@@ -71,12 +72,25 @@ class GraphPPOConfig:
                 ("learning_rate", self.learning_rate, False),
                 ("value_coefficient", self.value_coefficient, True),
                 ("entropy_coefficient", self.entropy_coefficient, True),
-                ("max_grad_norm", self.max_grad_norm, False)):
+                ("max_grad_norm", self.max_grad_norm, False),
+                ("value_huber_delta", self.value_huber_delta, False)):
             if (isinstance(value, bool) or
                     not isinstance(value, (int, float, np.integer, np.floating)) or
                     not math.isfinite(float(value)) or
                     (float(value) < 0 if allow_zero else float(value) <= 0)):
                 raise ValueError(f"{name} is invalid")
+
+
+def _huber_loss_and_gradient(error: float, delta: float):
+    """Return scalar Huber loss and its bounded derivative."""
+    error = float(error)
+    delta = float(delta)
+    if not math.isfinite(error) or not math.isfinite(delta) or delta <= 0:
+        raise ValueError("Huber inputs must be finite and delta positive")
+    magnitude = abs(error)
+    if magnitude <= delta:
+        return 0.5 * error * error, error
+    return delta * (magnitude - 0.5 * delta), math.copysign(delta, error)
 
 
 def graph_policy_inputs(robot_states, pending_tasks,
@@ -219,6 +233,10 @@ class GraphPPOModel:
             return {"updates": 0, "mean_loss": None}
         self._prepare_advantages(rollout)
         losses = []
+        actor_losses = []
+        value_losses = []
+        entropies = []
+        maximum_value_error = 0.0
         for _ in range(self.config.update_epochs):
             for step in rollout:
                 probabilities, value, _, cache = self.network.forward(
@@ -239,7 +257,9 @@ class GraphPPOModel:
                 grad_logits += self.config.entropy_coefficient*probabilities*(
                     np.log(np.maximum(probabilities, 1e-12))+entropy)
                 value_error = value-step.return_value
-                grad_value = self.config.value_coefficient*value_error
+                value_loss, value_gradient = _huber_loss_and_gradient(
+                    value_error, self.config.value_huber_delta)
+                grad_value = self.config.value_coefficient*value_gradient
                 grads = self.network.backward(
                     cache, grad_logits, grad_value)
                 self.optimizer.step(self.network.params, grads)
@@ -250,16 +270,26 @@ class GraphPPOModel:
                     ratio*step.advantage,
                     clipped_ratio*step.advantage)
                 loss = (actor_loss
-                        + 0.5*self.config.value_coefficient*value_error**2
+                        + self.config.value_coefficient*value_loss
                         - self.config.entropy_coefficient*entropy)
                 if not math.isfinite(loss):
                     raise ValueError("GraphPPO loss is non-finite")
                 losses.append(float(loss))
+                actor_losses.append(float(actor_loss))
+                value_losses.append(float(value_loss))
+                entropies.append(float(entropy))
+                maximum_value_error = max(
+                    maximum_value_error, abs(float(value_error)))
                 self.training_step += 1
         self.training_episodes += 1
         return {
             "updates": len(losses),
             "mean_loss": float(np.mean(losses)),
+            "mean_actor_loss": float(np.mean(actor_losses)),
+            "mean_huber_value_loss": float(np.mean(value_losses)),
+            "mean_entropy": float(np.mean(entropies)),
+            "max_abs_value_error": maximum_value_error,
+            "value_huber_delta": self.config.value_huber_delta,
         }
 
     def save(self, path):
@@ -375,20 +405,18 @@ class GraphPPOScheduler(BaseScheduler):
                         },
                     })
             probabilities, _, _ = self.model.edge_policy(features)
-            ranking = np.full(matrix.values.shape, np.inf, dtype=np.float64)
-            for index, (row, column) in enumerate(coordinates):
-                ranking[int(row), int(column)] = -math.log(max(
-                    float(probabilities[index]), 1e-12))
-            pairs = solve_hungarian(ranking, matrix.feasible)
+            edge_index = int(np.argmax(probabilities))
+            row, column = coordinates[edge_index]
+            pairs = [(int(row), int(column))]
             return _result_from_matching(
                 self.name, matrix, pairs, pending_tasks, robot_states,
                 context, started, {
                     "model": GRAPH_PPO_ALGORITHM,
-                    "decoder": "hungarian",
-                    "mean_selected_probability": float(np.mean([
-                        probabilities[index]
-                        for index, coordinate in enumerate(coordinates)
-                        if tuple(coordinate) in set(pairs)])) if pairs else 0.0,
+                    "decoder": "policy_argmax_edge",
+                    "action_semantics": GRAPH_PPO_ACTION_SEMANTICS,
+                    "selected_edge_index": edge_index,
+                    "selected_probability": float(
+                        probabilities[edge_index]),
                 })
         except Exception as exc:
             return SchedulerResult(

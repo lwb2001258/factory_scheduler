@@ -690,7 +690,8 @@ STARTUP_CONFIG = {
 # ================================================================
 # RL TRAINING PARAMETERS (PPO)
 # ================================================================
-RL_ENVIRONMENT_VERSION = "rl-scheduling-v6-noop-bootstrap-ppo-validation"
+RL_ENVIRONMENT_VERSION = (
+    "rl-scheduling-v32-headless-watchdog-timer-parity")
 
 RL_CONFIG = {
     "learning_rate": 3e-4,

@@ -57,14 +57,24 @@ class SarsaScheduler(_AgentScheduler):
             discrete_state = self.agent.discretize(state)
             physical_fine_tune = _physical_fine_tune_enabled()
             action = self.agent.select_action(
-                discrete_state, mask, training=physical_fine_tune)
+                discrete_state, mask, training=physical_fine_tune,
+                exploration_cap=(
+                    self.agent.config.physical_epsilon_cap
+                    if physical_fine_tune else None))
             assignment = self.environment.assignment_for_action(action)
             valid, reason = validate_assignment(
                 assignment, pending_tasks, robot_states, context)
         except Exception as exc:
             assignment, valid = None, False
             reason = f"sarsa_inference_error:{type(exc).__name__}"
-        diagnostics = {"reason": reason, "action": locals().get("action")}
+        diagnostics = {
+            "reason": reason, "action": locals().get("action"),
+            "epsilon": self.agent.epsilon,
+            "effective_epsilon": (
+                min(self.agent.epsilon,
+                    self.agent.config.physical_epsilon_cap)
+                if locals().get("physical_fine_tune", False) else 0.0),
+        }
         if (locals().get("physical_fine_tune", False) and valid and
                 assignment is not None):
             diagnostics.update({
@@ -108,14 +118,23 @@ class DQNScheduler(_AgentScheduler):
             mask = self.environment.get_action_mask()
             physical_fine_tune = _physical_fine_tune_enabled()
             action = self.agent.select_action(
-                state, mask, training=physical_fine_tune)
+                state, mask, training=physical_fine_tune,
+                exploration_cap=(self.agent.config.physical_epsilon_cap
+                                 if physical_fine_tune else None))
             assignment = self.environment.assignment_for_action(action)
             valid, reason = validate_assignment(
                 assignment, pending_tasks, robot_states, context)
         except Exception as exc:
             assignment, valid = None, False
             reason = f"dqn_inference_error:{type(exc).__name__}"
-        diagnostics = {"reason": reason, "action": locals().get("action")}
+        diagnostics = {
+            "reason": reason, "action": locals().get("action"),
+            "epsilon": self.agent.epsilon,
+            "effective_epsilon": (
+                min(self.agent.epsilon,
+                    self.agent.config.physical_epsilon_cap)
+                if locals().get("physical_fine_tune", False) else 0.0),
+        }
         if (locals().get("physical_fine_tune", False) and valid and
                 assignment is not None):
             diagnostics.update({
@@ -220,10 +239,11 @@ class PairwisePPOScheduler(_AgentScheduler):
 
 
 class RLSchedulerSafetyWrapper(BaseScheduler):
-    """Fail closed on model/policy errors and use deterministic Hungarian."""
+    """Fail closed, cool down briefly, then retry the primary policy."""
 
     def __init__(self, policy: BaseScheduler, timeout_seconds: float = None,
-                 max_consecutive_failures: int = 3):
+                 max_consecutive_failures: int = 3,
+                 cooldown_decisions: int = 3):
         super().__init__(policy.name)
         self.policy = policy
         self.fallback = HungarianScheduler()
@@ -231,8 +251,18 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
             timeout_seconds = float(os.environ.get(
                 "RL_SCHEDULER_TIMEOUT_SECONDS", "0.05"))
         self.timeout_seconds = max(0.001, float(timeout_seconds))
+        for name, value in (
+                ("max_consecutive_failures", max_consecutive_failures),
+                ("cooldown_decisions", cooldown_decisions)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         self.max_consecutive_failures = max_consecutive_failures
+        self.cooldown_decisions = cooldown_decisions
         self.consecutive_failures = 0
+        self.cooldown_remaining = 0
+        self.cooldown_count = 0
+        self.retry_count = 0
+        self._retry_pending = False
         self._last_source = "policy"
         self.policy_decisions = 0
         self.fallback_decisions = 0
@@ -259,13 +289,59 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
         item = result.assignments[0]
         return item.robot_id, item.task
 
+    def _diagnostic_counters(self) -> dict:
+        return {
+            "policy_decisions": self.policy_decisions,
+            "fallback_decisions": self.fallback_decisions,
+            "timeout_count": self.timeout_count,
+            "timeout_limit_ms": self.timeout_seconds * 1000.0,
+            "cooldown_remaining": self.cooldown_remaining,
+            "cooldown_count": self.cooldown_count,
+            "retry_count": self.retry_count,
+        }
+
     def assign(self, pending_tasks: List[TransportTask], robot_states: dict,
                context: Optional[SchedulingContext] = None):
         context = context or SchedulingContext()
         physical_fine_tune = self._physical_fine_tune_enabled()
-        if (physical_fine_tune or
-                self.consecutive_failures < self.max_consecutive_failures):
-            result = self.policy.assign(pending_tasks, robot_states, context)
+        if physical_fine_tune:
+            # Physical on-policy collection must not inherit evaluation-mode
+            # breaker state: it never substitutes a fallback action, and a
+            # rejected sample is not an inference outage.
+            self.consecutive_failures = 0
+            self.cooldown_remaining = 0
+            self._retry_pending = False
+        result = None
+        policy_seconds = 0.0
+        cooldown_started = False
+        cooldown_decision = False
+        retry_attempt = False
+
+        if not physical_fine_tune and self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+            cooldown_decision = True
+            failure_reason = "rl_cooldown"
+            if self.cooldown_remaining == 0:
+                self._retry_pending = True
+        else:
+            if not physical_fine_tune and self._retry_pending:
+                retry_attempt = True
+                self.retry_count += 1
+                self._retry_pending = False
+            started = time.perf_counter()
+            try:
+                result = self.policy.assign(
+                    pending_tasks, robot_states, context)
+            except Exception as exc:
+                result = SchedulerResult(
+                    algorithm_name=self.policy.name,
+                    computation_time=time.perf_counter() - started,
+                    diagnostics={
+                        "reason": "policy_exception",
+                        "exception": type(exc).__name__,
+                    },
+                )
+            policy_seconds = result.computation_time
             timed_out = result.computation_time > self.timeout_seconds
             if result.is_feasible and result.assignments and not timed_out:
                 self.consecutive_failures = 0
@@ -274,17 +350,12 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
                 result.diagnostics.update({
                     "fallback": False,
                     "inference_ms": result.computation_time * 1000.0,
-                    "policy_decisions": self.policy_decisions,
-                    "fallback_decisions": self.fallback_decisions,
-                    "timeout_count": self.timeout_count,
-                    "timeout_limit_ms": self.timeout_seconds * 1000.0,
+                    "retry_attempt": retry_attempt,
+                    **self._diagnostic_counters(),
                 })
                 return result
             if physical_fine_tune:
-                # An on-policy collection episode must never substitute a
-                # Hungarian action.  A legitimate empty action waits for the
-                # next physical dispatch opportunity; timeouts and policy
-                # errors are surfaced to the supervisor as hard failures.
+                # On-policy collection never substitutes a fallback action.
                 reason = result.diagnostics.get(
                     "reason", "invalid_rl_output")
                 if timed_out:
@@ -295,10 +366,8 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
                     "fallback": False,
                     "physical_fine_tune_rejected": True,
                     "inference_ms": result.computation_time * 1000.0,
-                    "policy_decisions": self.policy_decisions,
-                    "fallback_decisions": self.fallback_decisions,
-                    "timeout_count": self.timeout_count,
-                    "timeout_limit_ms": self.timeout_seconds * 1000.0,
+                    "retry_attempt": retry_attempt,
+                    **self._diagnostic_counters(),
                 })
                 return result
             self.consecutive_failures += 1
@@ -307,23 +376,25 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
             failure_reason = (
                 "inference_timeout" if timed_out
                 else result.diagnostics.get("reason", "invalid_rl_output"))
-        else:
-            failure_reason = "rl_temporarily_disabled"
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                self.cooldown_remaining = self.cooldown_decisions
+                self.cooldown_count += 1
+                self.consecutive_failures = 0
+                cooldown_started = True
+
         fallback = self.fallback.assign(pending_tasks, robot_states, context)
         self.fallback_decisions += 1
-        policy_seconds = (result.computation_time
-                          if 'result' in locals() else 0.0)
         fallback.computation_time += policy_seconds
         fallback.algorithm_name = f"{self.policy.name}_FALLBACK_HUNGARIAN"
         fallback.diagnostics.update({
-            "fallback": True, "rl_failure": failure_reason,
-            "consecutive_failures": self.consecutive_failures})
-        fallback.diagnostics.update({
+            "fallback": True,
+            "rl_failure": failure_reason,
+            "consecutive_failures": self.consecutive_failures,
+            "cooldown_started": cooldown_started,
+            "cooldown_decision": cooldown_decision,
+            "retry_attempt": retry_attempt,
             "inference_ms": policy_seconds * 1000.0,
-            "policy_decisions": self.policy_decisions,
-            "fallback_decisions": self.fallback_decisions,
-            "timeout_count": self.timeout_count,
-            "timeout_limit_ms": self.timeout_seconds * 1000.0,
+            **self._diagnostic_counters(),
         })
         self._last_source = "fallback"
         return fallback
@@ -336,19 +407,18 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
     def on_assignment_rejected(self, assignment, reason):
         target = self.policy if self._last_source == "policy" else self.fallback
         target.on_assignment_rejected(assignment, reason)
-        # A Webots route/command rejection is a physical commit failure, not
-        # a GraphPPO inference failure.  It must not activate a Hungarian
-        # fallback during an on-policy collection episode.
-        if self._physical_fine_tune_enabled():
-            self.consecutive_failures = 0
-        else:
-            self.consecutive_failures += 1
+        # Route/command rejection is a physical commit failure, not a policy
+        # inference failure, and therefore does not advance the breaker.
 
     def reset(self):
         super().reset()
         self.policy.reset()
         self.fallback.reset()
         self.consecutive_failures = 0
+        self.cooldown_remaining = 0
+        self.cooldown_count = 0
+        self.retry_count = 0
+        self._retry_pending = False
         self.policy_decisions = 0
         self.fallback_decisions = 0
         self.timeout_count = 0

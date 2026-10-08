@@ -177,6 +177,10 @@ def train_sarsa_agent(agent, episode_seeds: Iterable[int], *,
         "updates": len(errors),
         "mean_return": float(np.mean(returns)),
         "mean_abs_td_error": float(np.mean(np.abs(errors))),
+        "gamma": agent.config.gamma,
+        "epsilon": agent.epsilon,
+        "epsilon_decay": agent.config.epsilon_decay,
+        "physical_epsilon_cap": agent.config.physical_epsilon_cap,
         "runtime": summarize_runtime_telemetry(runtime_rows),
     }
 
@@ -224,6 +228,11 @@ def train_dqn_agent(agent, episode_seeds: Iterable[int], *,
         "updates": len(losses),
         "mean_return": float(np.mean(returns)),
         "mean_loss": float(np.mean(losses)) if losses else None,
+        "gamma": agent.config.gamma,
+        "epsilon": agent.epsilon,
+        "epsilon_decay_steps": agent.config.epsilon_decay_steps,
+        "physical_epsilon_cap": agent.config.physical_epsilon_cap,
+        "reward_attribution": "environment_action_transition",
         "runtime": summarize_runtime_telemetry(runtime_rows),
     }
 
@@ -271,19 +280,32 @@ def _ppo_cache(network, state, mask):
 
 def _pairwise_ppo_update(network, rollout, *, learning_rate, clip_ratio,
                          value_coefficient, entropy_coefficient,
-                         update_epochs, max_grad_norm) -> float:
+                         update_epochs, max_grad_norm, gamma=1.0,
+                         value_huber_delta=10.0) -> dict:
+    if (not math.isfinite(gamma) or gamma != 1.0 or
+            not math.isfinite(value_huber_delta) or
+            value_huber_delta <= 0):
+        raise ValueError(
+            "pairwise PPO requires gamma=1 and positive Huber delta")
+    if not rollout:
+        raise ValueError("pairwise PPO rollout cannot be empty")
     rewards = np.asarray([row[3] for row in rollout], dtype=np.float64)
     dones = np.asarray([row[6] for row in rollout], dtype=bool)
     values = np.asarray([row[5] for row in rollout], dtype=np.float64)
     returns = np.zeros_like(rewards)
     running = 0.0
     for index in range(len(rewards) - 1, -1, -1):
-        running = rewards[index] + 0.99 * running * (not dones[index])
+        running = rewards[index] + gamma * running * (not dones[index])
         returns[index] = running
     advantages = returns - values
     if len(advantages) > 1 and float(np.std(advantages)) > 1e-8:
         advantages = (advantages - advantages.mean()) / advantages.std()
     losses = []
+    policy_losses = []
+    value_losses = []
+    entropies = []
+    clipped_gradient_epochs = 0
+    maximum_unclipped_gradient_norm = 0.0
     for _ in range(update_epochs):
         gradients = {
             "W1": np.zeros_like(network.W1), "b1": np.zeros_like(network.b1),
@@ -294,6 +316,9 @@ def _pairwise_ppo_update(network, rollout, *, learning_rate, clip_ratio,
             "b_value": np.zeros_like(network.b_value),
         }
         epoch_loss = 0.0
+        epoch_policy_loss = 0.0
+        epoch_value_loss = 0.0
+        epoch_entropy = 0.0
         for index, row in enumerate(rollout):
             state, mask, action, _, old_log_probability, _, _ = row
             probabilities, value, cache = _ppo_cache(network, state, mask)
@@ -318,7 +343,16 @@ def _pairwise_ppo_update(network, rollout, *, learning_rate, clip_ratio,
             grad_logits[legal] += entropy_coefficient * probabilities[legal] * (
                 np.log(probabilities[legal]) - mean_log)
             value_error = value - returns[index]
-            grad_value = value_coefficient * value_error
+            absolute_value_error = abs(value_error)
+            if absolute_value_error <= value_huber_delta:
+                huber_value_loss = 0.5 * value_error * value_error
+                huber_value_gradient = value_error
+            else:
+                huber_value_loss = value_huber_delta * (
+                    absolute_value_error - 0.5 * value_huber_delta)
+                huber_value_gradient = math.copysign(
+                    value_huber_delta, value_error)
+            grad_value = value_coefficient * huber_value_gradient
             x, z1, h1, z2, h2 = cache
             gradients["W_policy"] += np.outer(h2, grad_logits)
             gradients["b_policy"] += grad_logits
@@ -333,20 +367,42 @@ def _pairwise_ppo_update(network, rollout, *, learning_rate, clip_ratio,
             grad_z1 = grad_h1 * ((z1 > 0.0) & (z1 < 50.0))
             gradients["W1"] += np.outer(x, grad_z1)
             gradients["b1"] += grad_z1
-            epoch_loss += (-objective + 0.5 * value_coefficient
-                           * value_error * value_error
+            epoch_loss += (-objective + value_coefficient
+                           * huber_value_loss
                            - entropy_coefficient * entropy)
+            epoch_policy_loss += -objective
+            epoch_value_loss += huber_value_loss
+            epoch_entropy += entropy
         scale = 1.0 / len(rollout)
         norm = math.sqrt(sum(float(np.sum((value * scale) ** 2))
                              for value in gradients.values()))
         clip = min(1.0, max_grad_norm / max(norm, 1e-12))
+        maximum_unclipped_gradient_norm = max(
+            maximum_unclipped_gradient_norm, norm)
+        clipped_gradient_epochs += int(clip < 1.0)
         for name, gradient in gradients.items():
             target = getattr(network, name)
             target -= learning_rate * gradient * scale * clip
             if not np.isfinite(target).all():
                 raise ValueError("PPO update produced non-finite parameters")
         losses.append(epoch_loss * scale)
-    return float(np.mean(losses))
+        policy_losses.append(epoch_policy_loss * scale)
+        value_losses.append(epoch_value_loss * scale)
+        entropies.append(epoch_entropy * scale)
+    network.ppo_gamma = float(gamma)
+    network.value_huber_delta = float(value_huber_delta)
+    return {
+        "mean_loss": float(np.mean(losses)),
+        "mean_policy_loss": float(np.mean(policy_losses)),
+        "mean_huber_value_loss": float(np.mean(value_losses)),
+        "mean_entropy": float(np.mean(entropies)),
+        "gamma": float(gamma),
+        "value_huber_delta": float(value_huber_delta),
+        "clipped_gradient_epochs": clipped_gradient_epochs,
+        "maximum_unclipped_gradient_norm": (
+            maximum_unclipped_gradient_norm),
+        "update_epochs": update_epochs,
+    }
 
 
 def train_pairwise_ppo(network, episode_seeds: Iterable[int], *,
@@ -356,23 +412,27 @@ def train_pairwise_ppo(network, episode_seeds: Iterable[int], *,
                        value_coefficient: float = 0.5,
                        entropy_coefficient: float = 0.01,
                        update_epochs: int = 4,
-                       max_grad_norm: float = 1.0) -> dict:
+                       max_grad_norm: float = 1.0,
+                       gamma: float = 1.0,
+                       value_huber_delta: float = 10.0) -> dict:
     """Train the pair-action PPO checkpoint used by ``PairwisePPOScheduler``."""
     seeds = _strict_seeds(episode_seeds)
     numeric = (learning_rate, clip_ratio, value_coefficient,
-               entropy_coefficient, max_grad_norm)
+               entropy_coefficient, max_grad_norm, gamma,
+               value_huber_delta)
     if (isinstance(max_steps, bool) or not isinstance(max_steps, int) or
             max_steps <= 0 or isinstance(update_epochs, bool) or
             not isinstance(update_epochs, int) or update_epochs <= 0 or
             any(not math.isfinite(value) or value < 0 for value in numeric) or
             learning_rate <= 0 or not 0 < clip_ratio <= 1.0 or
-            max_grad_norm <= 0):
+            max_grad_norm <= 0 or gamma != 1.0 or
+            value_huber_delta <= 0):
         raise ValueError("invalid pairwise PPO training configuration")
     environment = _environment(env_config)
     if (network.state_dim != environment.observation_dim or
             network.action_dim != environment.action_dim):
         raise ValueError("PPO dimensions do not match training environment")
-    losses, returns, runtime_rows = [], [], []
+    updates, returns, runtime_rows = [], [], []
     rng = np.random.default_rng(seeds[0])
     for seed in seeds:
         robots, tasks, context = factory_scenario(seed)
@@ -394,18 +454,31 @@ def train_pairwise_ppo(network, episode_seeds: Iterable[int], *,
             if done:
                 break
         if rollout:
-            losses.append(_pairwise_ppo_update(
+            updates.append(_pairwise_ppo_update(
                 network, rollout, learning_rate=learning_rate,
                 clip_ratio=clip_ratio, value_coefficient=value_coefficient,
                 entropy_coefficient=entropy_coefficient,
-                update_epochs=update_epochs, max_grad_norm=max_grad_norm))
+                update_epochs=update_epochs, max_grad_norm=max_grad_norm,
+                gamma=gamma, value_huber_delta=value_huber_delta))
         returns.append(episode_return)
         runtime_rows.append(environment.runtime_telemetry())
     return {
         "episodes": len(seeds),
         "episode_seeds": list(seeds),
-        "updates": len(losses),
+        "updates": len(updates),
         "mean_return": float(np.mean(returns)),
-        "mean_loss": float(np.mean(losses)) if losses else None,
+        "mean_loss": (
+            float(np.mean([row["mean_loss"] for row in updates]))
+            if updates else None),
+        "mean_policy_loss": (
+            float(np.mean([row["mean_policy_loss"] for row in updates]))
+            if updates else None),
+        "mean_huber_value_loss": (
+            float(np.mean([
+                row["mean_huber_value_loss"] for row in updates]))
+            if updates else None),
+        "gamma": gamma,
+        "value_huber_delta": value_huber_delta,
+        "reward_attribution": "environment_action_transition",
         "runtime": summarize_runtime_telemetry(runtime_rows),
     }

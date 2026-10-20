@@ -98,6 +98,23 @@ SCHEDULER_WAIT_REASONS = frozenset({
     "empty_assignments", "pair_temporarily_blocked",
 })
 
+# Composite schedulers retain their own rejection category in ``reason`` while
+# appending the leaf scheduler's cause.  Only unwrap prefixes owned by this
+# runtime; accepting an arbitrary ``*:empty_assignments`` suffix would let an
+# unrelated model error bypass the fail-closed physical fine-tune gate.
+SCHEDULER_WAIT_REASON_PREFIXES = ("linucb_arm_rejected:",)
+
+
+def is_scheduler_wait_reason(reason) -> bool:
+    """Return whether *reason* represents a legitimate no-action tick."""
+    normalized = str(reason or "").strip()
+    if normalized in SCHEDULER_WAIT_REASONS:
+        return True
+    for prefix in SCHEDULER_WAIT_REASON_PREFIXES:
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):] in SCHEDULER_WAIT_REASONS
+    return False
+
 
 def _validate_runtime_task_manifest(document, *, scenario: str, seed: int,
                                     timestep_ms: int,
@@ -6423,15 +6440,16 @@ class FactorySupervisor:
             if not decision.is_feasible or not decision.assignments:
                 reason = decision.diagnostics.get("reason", "")
                 if self._physical_fine_tune_enabled:
-                    if reason in SCHEDULER_WAIT_REASONS:
+                    if is_scheduler_wait_reason(reason):
                         # GraphPPO's physical action space has no no-op edge.
-                        # Waiting keeps collection on-policy; a deterministic
-                        # fallback assignment would contaminate the rollout.
+                        # LinUCB arms can reach the same state after a physical
+                        # commit rejection.  Waiting keeps collection on-policy;
+                        # a deterministic fallback would contaminate rollout.
                         break
                     raise RuntimeError(
                         "physical fine tune policy failed: " + str(reason))
                 self.metrics.record_scheduler_fallback(
-                    invalid_output=reason not in SCHEDULER_WAIT_REASONS,
+                    invalid_output=not is_scheduler_wait_reason(reason),
                     reason=reason)
                 print(f"[T={self.sim_time:.1f}] Scheduler {self.scheduler.name} "
                       f"rejected: {decision.diagnostics.get('reason')}; "

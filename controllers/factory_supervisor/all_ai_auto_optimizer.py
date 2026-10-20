@@ -22,14 +22,32 @@ from rl_agents import DQNConfig, SarsaConfig
 ALL_AI_SEARCH_VERSION = (
     "all-ai-dual-objective-independent-search-v4-stratified-coverage")
 VALIDATION_SELECTOR_VERSION = "strict-validation-selector-v3"
-FORMAL_VALIDATION_SEEDS = tuple(range(31000, 31005))
+# Two independent seeds per scenario are sufficient for each recurring
+# standalone checkpoint validation.  Historical five-seed reports remain
+# admissible resume evidence so an operator-requested reduction never
+# invalidates or rewrites already committed model artifacts.
+FORMAL_VALIDATION_SEEDS = tuple(range(31000, 31002))
+LEGACY_FORMAL_VALIDATION_SEED_CONTRACTS = (
+    tuple(range(31000, 31005)),
+)
+ACCEPTED_FORMAL_VALIDATION_SEED_CONTRACTS = (
+    FORMAL_VALIDATION_SEEDS,
+    *LEGACY_FORMAL_VALIDATION_SEED_CONTRACTS,
+)
 FORMAL_SCENARIOS = ("A", "B", "C")
 STANDALONE_TRAINING_SEEDS = tuple(range(21000, 21200))
-MIN_STANDALONE_BALANCED_ROUNDS = 100
-MAX_STANDALONE_BALANCED_ROUNDS = 200
 VALIDATION_INTERVAL_ROUNDS = 5
 CONVERGENCE_PATIENCE_CHECKS = 3
 PARAMETER_CONVERGENCE_PATIENCE_CHECKS = 3
+# Convergence, rather than an arbitrary 100-round floor, controls when
+# standalone training may stop. Four validation observations are the minimum
+# needed to compare a three-check recent window with earlier history; at a
+# five-round cadence this makes the earliest possible stop 20 balanced A/B/C
+# rounds. The upper bound remains a fail-safe for a model that never converges.
+MIN_STANDALONE_BALANCED_ROUNDS = (
+    max(CONVERGENCE_PATIENCE_CHECKS + 1,
+        PARAMETER_CONVERGENCE_PATIENCE_CHECKS) * VALIDATION_INTERVAL_ROUNDS)
+MAX_STANDALONE_BALANCED_ROUNDS = 200
 PARAMETER_RELATIVE_CHANGE_THRESHOLD = 1e-2
 CONVERGENCE_MIN_IMPROVEMENT = {
     "count": 0.5,
@@ -904,6 +922,8 @@ def standalone_training_readiness(policy_id: str, training_records,
         validation_by_round[round_index] = row
         metric = row.get("validation_metric")
         parameter_change = row.get("parameter_change", {})
+        candidate_parameter_change = row.get(
+            "candidate_parameter_change", parameter_change)
         if (isinstance(round_index, bool) or not isinstance(round_index, int) or
                 round_index < VALIDATION_INTERVAL_ROUNDS or
                 round_index > MAX_STANDALONE_BALANCED_ROUNDS or
@@ -913,8 +933,8 @@ def standalone_training_readiness(policy_id: str, training_records,
                 row.get("selection_metric") != metric_name or
                 row.get("eligible") is not True or
                 row.get("duration_seconds") != 1800.0 or
-                tuple(row.get("validation_seeds", ())) !=
-                FORMAL_VALIDATION_SEEDS or
+                tuple(row.get("validation_seeds", ())) not in
+                ACCEPTED_FORMAL_VALIDATION_SEED_CONTRACTS or
                 not _is_sha256(row.get("checkpoint_sha256")) or
                 not _is_sha256(row.get("checkpoint_identity_sha256")) or
                 not _is_sha256(row.get("selector_report_sha256")) or
@@ -932,7 +952,23 @@ def standalone_training_readiness(policy_id: str, training_records,
                 parameter_change["relative_l2_change"] < 0 or
                 isinstance(parameter_change.get("parameter_count"), bool) or
                 not isinstance(parameter_change.get("parameter_count"), int) or
-                parameter_change["parameter_count"] < 1):
+                parameter_change["parameter_count"] < 1 or
+                not isinstance(candidate_parameter_change, Mapping) or
+                candidate_parameter_change.get("schema_version") != 1 or
+                candidate_parameter_change.get("reference_round") !=
+                    max(0, round_index-VALIDATION_INTERVAL_ROUNDS) or
+                isinstance(candidate_parameter_change.get(
+                    "relative_l2_change"), bool) or
+                not isinstance(candidate_parameter_change.get(
+                    "relative_l2_change"), (int, float)) or
+                not math.isfinite(
+                    candidate_parameter_change["relative_l2_change"]) or
+                candidate_parameter_change["relative_l2_change"] < 0 or
+                isinstance(candidate_parameter_change.get(
+                    "parameter_count"), bool) or
+                not isinstance(candidate_parameter_change.get(
+                    "parameter_count"), int) or
+                candidate_parameter_change["parameter_count"] < 1):
             invalid_validations.append("invalid_validation_record")
     required_validation_rounds = tuple(range(
         VALIDATION_INTERVAL_ROUNDS,
@@ -952,9 +988,9 @@ def standalone_training_readiness(policy_id: str, training_records,
                            for round_index in required_validation_rounds
                            if round_index in validation_by_round]
     # Never promote an early lucky checkpoint after claiming that the model
-    # received sufficient training.  Selection is restricted to checkpoints
-    # at/after the 100-round floor and to the final parameter-convergence
-    # window; older validation results remain diagnostics only.
+    # converged. Selection is restricted to checkpoints at/after the minimum
+    # evidence window and to the final parameter-convergence window; older
+    # validation results remain diagnostics only.
     sufficiently_trained = [
         row for row in ordered_validations
         if row["round_index"] >= MIN_STANDALONE_BALANCED_ROUNDS]
@@ -981,7 +1017,9 @@ def standalone_training_readiness(policy_id: str, training_records,
             len(ordered_validations) >=
                 PARAMETER_CONVERGENCE_PATIENCE_CHECKS):
         recent_parameter_changes = [
-            float(row["parameter_change"]["relative_l2_change"])
+            float(row.get(
+                "candidate_parameter_change", row["parameter_change"])
+                ["relative_l2_change"])
             for row in ordered_validations[
                 -PARAMETER_CONVERGENCE_PATIENCE_CHECKS:]
         ]
@@ -989,6 +1027,8 @@ def standalone_training_readiness(policy_id: str, training_records,
             value <= PARAMETER_RELATIVE_CHANGE_THRESHOLD
             for value in recent_parameter_changes)
 
+    maximum_rounds_reached = (
+        completed_rounds >= MAX_STANDALONE_BALANCED_ROUNDS)
     if invalid_records or invalid_validations:
         status = "invalid_training_evidence"
     elif missing_validation_rounds:
@@ -997,17 +1037,30 @@ def standalone_training_readiness(policy_id: str, training_records,
         status = "insufficient_training"
     elif stable and parameter_converged:
         status = "qualified_for_webots_fine_tune"
-    elif completed_rounds >= MAX_STANDALONE_BALANCED_ROUNDS:
-        status = "research_candidate_not_converged"
+    elif maximum_rounds_reached:
+        # The maximum is a completed collection stage, not evidence that the
+        # parameters converged.  Preserve the honest convergence flags and
+        # advance the best guarded validation checkpoint to Webots, where the
+        # paired non-regression gate still protects the pre-tune model.
+        status = "maximum_completed_for_webots_fine_tune"
     else:
         status = "continue_training"
+    completion_reason = (
+        "validation_and_parameter_converged"
+        if status == "qualified_for_webots_fine_tune" else
+        "maximum_balanced_rounds_reached"
+        if status == "maximum_completed_for_webots_fine_tune" else None)
     report = {
         "policy_id": policy_id,
         "objective": objective,
         "training_mode": SEARCH_SPACES[policy_id].training_mode,
         "status": status,
-        "webots_fine_tune_eligible": (
-            status == "qualified_for_webots_fine_tune"),
+        "webots_fine_tune_eligible": status in {
+            "qualified_for_webots_fine_tune",
+            "maximum_completed_for_webots_fine_tune",
+        },
+        "standalone_completion_reason": completion_reason,
+        "maximum_rounds_reached": maximum_rounds_reached,
         "completed_balanced_rounds": completed_rounds,
         "completed_episode_count": completed_rounds*len(FORMAL_SCENARIOS),
         "scenario_episode_counts": {

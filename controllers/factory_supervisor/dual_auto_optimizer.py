@@ -37,6 +37,10 @@ from training_scenarios import factory_scenario, formal_scenario_config
 
 AUTO_TUNING_VERSION = "dual-auto-optimization-v1"
 SCENARIO_IDS = ("A", "B", "C")
+GRAPH_PPO_TRAINING_SEED_BOUNDS = MappingProxyType({
+    "standalone_tuning_training": (11000, 11999),
+    "standalone_training": (21000, 21999),
+})
 
 
 def _canonical_sha256(value) -> str:
@@ -451,12 +455,14 @@ def train_objective_graph_ppo(
         duration_seconds: float,
         utility_profile: Optional[UtilityV2RewardProfile] = None,
         manifests: Optional[Mapping[Tuple[str, int], dict]] = None,
-        max_steps_per_episode: Optional[int] = None) -> dict:
+        max_steps_per_episode: Optional[int] = None,
+        seed_partition: str = "standalone_training") -> dict:
     """Incrementally train GraphPPO on canonical objective-aware episodes.
 
     The function accepts training keys only; validation and final-test seeds
-    have no entry point here.  Callers are expected to pass a curriculum
-    prefix from :func:`curriculum_episode_keys`.
+    have no entry point here.  The default remains the sufficient-training
+    partition used by :func:`curriculum_episode_keys`; the strict workflow
+    must explicitly identify its isolated hyperparameter-training partition.
     """
     if not isinstance(model, GraphPPOModel):
         raise ValueError("model must be GraphPPOModel")
@@ -472,6 +478,9 @@ def train_objective_graph_ppo(
         raise ValueError("episode_keys must be iterable") from exc
     if not keys:
         raise ValueError("episode_keys must not be empty")
+    if seed_partition not in GRAPH_PPO_TRAINING_SEED_BOUNDS:
+        raise ValueError("unknown GraphPPO training seed partition")
+    seed_lower, seed_upper = GRAPH_PPO_TRAINING_SEED_BOUNDS[seed_partition]
     canonical_keys = []
     for key in keys:
         if not isinstance(key, (tuple, list)) or len(key) != 2:
@@ -480,8 +489,10 @@ def train_objective_graph_ppo(
         if scenario_id not in SCENARIO_IDS:
             raise ValueError("training scenario must be A, B, or C")
         seed = _strict_integer(seed, "training seed")
-        if not 21000 <= seed <= 21999:
-            raise ValueError("training seed must be within 21000-21999")
+        if not seed_lower <= seed <= seed_upper:
+            raise ValueError(
+                f"training seed must be within {seed_lower}-{seed_upper} "
+                f"for {seed_partition}")
         canonical_keys.append((scenario_id, seed))
     if len(canonical_keys) != len(set(canonical_keys)):
         raise ValueError("episode_keys must not contain duplicates")
@@ -657,6 +668,7 @@ def train_objective_graph_ppo(
         raise RuntimeError("objective training produced non-finite metrics")
     return {
         "objective": objective,
+        "seed_partition": seed_partition,
         "reward_attribution": "task_lifecycle_action_level",
         "reward_conservation_verified": True,
         "episode_keys": [list(key) for key in canonical_keys],

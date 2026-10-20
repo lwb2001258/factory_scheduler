@@ -57,7 +57,7 @@ AI_TRAINING_CAPABILITIES = MappingProxyType({
         "collect_cql_dataset", True),
     "LinUCB": AITrainingCapability(
         "scheduler_result", "contextual_bandit",
-        "train_linucb", False),
+        "train_linucb", True),
 })
 
 if tuple(AI_TRAINING_CAPABILITIES) != AI_ALGORITHM_NAMES:

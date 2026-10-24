@@ -354,7 +354,14 @@ class MetricsCollector:
             self, algorithm_name: str, proposed_pair_count: int,
             objective_value: Optional[float],
             first_assignment_estimated_cost: Optional[float]):
-        """Separate a solver's joint proposal from its first physical attempt."""
+        """Separate a solver's joint proposal from its first physical attempt.
+
+        Objective-specific learned schedulers minimize signed expert costs:
+        priority, waiting, and deadline bonuses can legitimately make both the
+        joint objective and a selected edge negative.  These values are
+        telemetry rather than physical distances, so require finiteness but
+        preserve their sign.
+        """
         if (isinstance(proposed_pair_count, bool) or
                 not isinstance(proposed_pair_count, int) or
                 proposed_pair_count <= 0):
@@ -366,8 +373,8 @@ class MetricsCollector:
             if value is not None and (
                     isinstance(value, bool) or
                     not isinstance(value, (int, float)) or
-                    not math.isfinite(value) or value < 0):
-                raise ValueError(f"{name} must be finite and nonnegative")
+                    not math.isfinite(value)):
+                raise ValueError(f"{name} must be a finite number")
         algorithm = str(algorithm_name or "unknown")
         stats = self.solver_execution_by_algorithm.setdefault(algorithm, {
             "joint_solution_count": 0,

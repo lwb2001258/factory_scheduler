@@ -30,7 +30,9 @@ from schedulers import (
     build_cost_matrix,
 )
 from task_generator import TransportTask
-from traffic_features import TRAFFIC_FEATURE_NAMES, TRAFFIC_VERSION, TrafficSnapshot
+from traffic_features import (
+    TRAFFIC_FEATURE_NAMES, TRAFFIC_VERSION, TrafficSnapshot,
+    evaluate_traffic_edge)
 
 
 FEATURE_VERSION = "factory-pair-v2-priority-horizon"
@@ -277,18 +279,23 @@ def graph_edge_feature_tensor(matrix: CostMatrix,
     return output
 
 
-def _traffic_edge_values(matrix, context):
+def traffic_edge_values(matrix, context):
+    """Canonical matrix-shaped traffic inputs shared with neural SARSA."""
     snapshot = context.traffic_context
     if not isinstance(snapshot, TrafficSnapshot) or snapshot.now != context.current_time:
         raise ValueError("traffic model requires a current, frozen traffic snapshot")
     features = np.zeros(matrix.values.shape + (len(TRAFFIC_FEATURE_NAMES),))
     penalties = np.zeros(matrix.values.shape)
+    raw = (matrix.unfloored_values if matrix.unfloored_values is not None
+           else matrix.values)
     for row, rid in enumerate(matrix.robot_ids):
         for column, task in enumerate(matrix.tasks):
             if matrix.feasible[row, column]:
-                vector = snapshot.features(rid, task.pickup_position, task.delivery_position)
-                features[row, column] = vector
-                penalties[row, column] = snapshot.expert_penalty(vector)
+                edge = evaluate_traffic_edge(
+                    snapshot, rid, task.pickup_position,
+                    task.delivery_position, raw[row, column])
+                features[row, column] = edge.features
+                penalties[row, column] = edge.expert_penalty
     return features, penalties
 
 
@@ -296,7 +303,7 @@ def _traffic_adjusted_pairs(matrix, pair_features, context):
     """Share endpoint and route semantics between both learned matchers."""
     if pair_features.shape != matrix.values.shape + (len(PAIR_FEATURE_NAMES),):
         raise ValueError("traffic pair feature tensor has an invalid shape")
-    traffic, penalties = _traffic_edge_values(matrix, context)
+    traffic, penalties = traffic_edge_values(matrix, context)
     raw = (matrix.unfloored_values if matrix.unfloored_values is not None
            else matrix.values)
     values = np.where(matrix.feasible, np.maximum(0.0, raw + penalties), np.inf)
@@ -304,13 +311,15 @@ def _traffic_adjusted_pairs(matrix, pair_features, context):
                           matrix.feasible, raw + penalties)
     pairs = pair_features.copy()
     for column, task in enumerate(matrix.tasks):
-        pickup = context.traffic_context.endpoint_load(task.pickup_position)
-        delivery = context.traffic_context.endpoint_load(task.delivery_position)
         for row in range(len(matrix.robot_ids)):
             if matrix.feasible[row, column]:
-                pairs[row, column, PAIR_FEATURE_NAMES.index("baseline_pair_cost")] = values[row, column]
-                pairs[row, column, PAIR_FEATURE_NAMES.index("pickup_congestion")] = pickup
-                pairs[row, column, PAIR_FEATURE_NAMES.index("delivery_congestion")] = delivery
+                edge = evaluate_traffic_edge(
+                    context.traffic_context, matrix.robot_ids[row],
+                    task.pickup_position, task.delivery_position,
+                    raw[row, column])
+                pairs[row, column, PAIR_FEATURE_NAMES.index("baseline_pair_cost")] = edge.adjusted_cost
+                pairs[row, column, PAIR_FEATURE_NAMES.index("pickup_congestion")] = edge.pickup_load
+                pairs[row, column, PAIR_FEATURE_NAMES.index("delivery_congestion")] = edge.delivery_load
     return adjusted, pairs, traffic, penalties
 
 
@@ -355,7 +364,7 @@ def traffic_pair_feature_tensor(matrix, pair_features, context):
 def traffic_objective_expert_values(matrix, context, objective):
     """Preserve Count/Utility objectives, adding route-specific delay costs."""
     values = objective_expert_values(matrix, context, objective)
-    _features, penalties = _traffic_edge_values(matrix, context)
+    _features, penalties = traffic_edge_values(matrix, context)
     values[matrix.feasible] += penalties[matrix.feasible]
     return values
 

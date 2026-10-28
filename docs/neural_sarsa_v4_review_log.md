@@ -1,0 +1,42 @@
+# Neural SARSA v4 review log
+
+## Step 1 — baseline preservation and design
+
+- Review A (scope): passed. PR #6 preserves the 18 local source/workflow files
+  at commit `91220a3`; Python caches, IDE state, generated results, and generated
+  manifests were excluded.
+- Review B (algorithm): passed after excluding generic replay and defining
+  masked legal-only dueling centering, stored behavior probabilities, terminal
+  n-step flushing, and a separate WAIT head.
+- Review C (integration): passed after separating the v4 checkpoint/environment
+  contract from v3, pinning CPU Webots inference, and fixing evaluation seeds to
+  61000--61005 without a non-regression/rollback gate.
+
+The two requested detailed proposal-review rounds are recorded in
+`docs/neural_sarsa_v4_design_review.md`.
+
+## Step 2 — shared traffic contract and v4 features
+
+Initial Review A required changes: the parity assertion compared clipped v3
+features with unbounded raw traffic features.  The comparison was moved into
+the identical normalized and clipped feature space and all reviews restarted.
+
+- Review A (algorithm/semantics): passed.  Both GraphImitation and SARSA call
+  `evaluate_traffic_edge`; the same frozen snapshot produces the nine traffic
+  fields, expert penalty, adjusted unfloored baseline cost, and endpoint loads.
+  The penalty is observation-only for SARSA.
+- Review B (runtime/safety): passed.  The helper is read-only, rejects stale
+  types/non-finite costs, preserves GraphImitation's nonnegative adjusted-cost
+  floor, and keeps the v3 feature/checkpoint ABI unchanged.
+- Review C (tests/final diff): passed.  58 focused tests passed, the three files
+  compiled from source, the 161x457/385+72 v4 feature smoke test passed, and
+  `git diff --check` passed.
+
+Reviewed source SHA-256:
+
+```text
+3C6FF71348BE8542AD774B6FDAC0F16CBD1BBCCA2F793562917E9172DA638ED9  controllers/factory_supervisor/traffic_features.py
+BB9DDDAC63E3F83E20113E705C0DDCD655AA00FC889042E59E8EF7CE68C3D6AC  controllers/factory_supervisor/learning_scheduler.py
+12231F487989458E4C04988E25811961B359D3BFC97B48B1BAEC00C8345F2ADC  controllers/factory_supervisor/sarsa_v4_features.py
+```
+

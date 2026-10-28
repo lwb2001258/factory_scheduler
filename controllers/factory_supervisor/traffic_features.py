@@ -33,6 +33,17 @@ TRAFFIC_FEATURE_NAMES = (
 )
 
 
+@dataclass(frozen=True)
+class TrafficEdgeEvaluation:
+    """One immutable assignment-edge view shared by learned schedulers."""
+
+    features: tuple
+    expert_penalty: float
+    adjusted_cost: float
+    pickup_load: float
+    delivery_load: float
+
+
 def _xy(point):
     result = (float(point[0]), float(point[1]))
     if not all(math.isfinite(value) for value in result):
@@ -292,6 +303,35 @@ class TrafficSnapshot:
         return sum(len(self.occupants.get((slot, cell), ())) / capacity
                    for slot in range(int(HORIZON / TIME_BIN))) / (
                        HORIZON / TIME_BIN)
+
+
+def evaluate_traffic_edge(snapshot, robot_id, pickup, delivery, raw_cost):
+    """Return the canonical GraphImitation traffic view for one edge.
+
+    ``raw_cost`` is the unfloored baseline matching cost. Keeping this helper
+    in the traffic module avoids a dependency cycle between feature builders
+    and guarantees that GraphImitation and neural SARSA use the same frozen
+    forecast, penalty conversion, and endpoint-load definitions.
+    """
+    if not isinstance(snapshot, TrafficSnapshot):
+        raise ValueError("traffic edge evaluation requires a frozen snapshot")
+    raw_cost = float(raw_cost)
+    if not math.isfinite(raw_cost):
+        raise ValueError("traffic edge baseline cost must be finite")
+    features = tuple(float(value) for value in snapshot.features(
+        robot_id, pickup, delivery))
+    if (len(features) != len(TRAFFIC_FEATURE_NAMES) or
+            not all(math.isfinite(value) for value in features)):
+        raise ValueError("traffic edge features are invalid")
+    penalty = float(snapshot.expert_penalty(features))
+    adjusted = max(0.0, raw_cost + penalty)
+    pickup_load = float(snapshot.endpoint_load(pickup))
+    delivery_load = float(snapshot.endpoint_load(delivery))
+    values = (penalty, adjusted, pickup_load, delivery_load)
+    if not all(math.isfinite(value) and value >= 0.0 for value in values):
+        raise ValueError("traffic edge costs must be finite and nonnegative")
+    return TrafficEdgeEvaluation(
+        features, penalty, adjusted, pickup_load, delivery_load)
 
 
 class TrafficSnapshotBuilder:

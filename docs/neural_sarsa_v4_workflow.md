@@ -40,4 +40,3 @@ before the next step starts.
 - Training proceeds directly to the next registered phase; there is no
   intermediate degradation test.
 - An interrupted command resumes from its last complete episode/checkpoint.
-

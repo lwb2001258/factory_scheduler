@@ -108,4 +108,3 @@ Findings and resolutions:
 - Five-step Expected SARSA, Huber loss, Adam at 1e-4, gradient norm cap 5,
   target synchronization every 500 optimizer steps.
 - Epsilon 0.20 -> 0.02 in standalone; physical cap 0.01; evaluation 0.
-

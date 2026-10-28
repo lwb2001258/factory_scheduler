@@ -40,3 +40,24 @@ BB9DDDAC63E3F83E20113E705C0DDCD655AA00FC889042E59E8EF7CE68C3D6AC  controllers/fa
 12231F487989458E4C04988E25811961B359D3BFC97B48B1BAEC00C8345F2ADC  controllers/factory_supervisor/sarsa_v4_features.py
 ```
 
+## Step 3 — masked dueling Expected SARSA agent
+
+- Review A (algorithm/semantics): passed.  Legal-only dueling centering, exact
+  epsilon-greedy tie probabilities, five-step return maturation, terminal
+  shorter-return flushing, and online-policy/target-value separation were read
+  independently.  A constructed two-action case produced the exact Expected
+  SARSA target `0.1*1 + 0.9*3 = 2.8`.
+- Review B (device/persistence): passed.  CPU train/save/load/RNG continuation,
+  CUDA inference, and CUDA backward/optimizer execution passed.  The checkpoint
+  rejects incompatible feature/objective metadata and cannot be written with a
+  partial trajectory or minibatch.
+- Review C (tests/final diff): passed.  AST compilation, 41-transition n-step
+  maturation, masked selection, state-hash round trip, legacy v3 agent tests,
+  finite gradient clipping, and `git diff --check` passed.  The final network
+  has 77,443 trainable parameters.
+
+Reviewed source SHA-256:
+
+```text
+1B04F9B8F790E911EF4CCAC582EEE94AEAFF2639D28644567721ED153A3D9A11  controllers/factory_supervisor/sarsa_v4_agent.py
+```

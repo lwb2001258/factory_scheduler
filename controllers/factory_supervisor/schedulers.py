@@ -1824,7 +1824,7 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
     Args:
         scheduler_type: One of "FCFS", "NearestNeighbour", "RoundRobin",
             "Greedy", "Random", "Hungarian", "Auction", "GA", "SA",
-            "LearnedHungarian", "GraphImitation", "GraphPPO", "RainbowDQN",
+            "LearnedHungarian", "GraphImitation", "GraphExpert", "GraphPPO", "RainbowDQN",
             "QRDQN", "CQL", "LinUCB", "PPO_RL", "DQN", "SARSA"
         model_path: Path to a validated checkpoint for a learned scheduler.
         
@@ -1853,6 +1853,11 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
             time_budget_ms=float(os.environ.get("SA_TIME_BUDGET_MS", "5"))),
     }
 
+    if scheduler_type in {"GraphExpert", "TrafficHungarian"}:
+        from graph_expert_scheduler import GraphExpertScheduler, TrafficHungarianScheduler
+        cls = TrafficHungarianScheduler if scheduler_type == "TrafficHungarian" else GraphExpertScheduler
+        return cls(model_path)
+
     if scheduler_type in {"LearnedHungarian", "GraphImitation"}:
         try:
             from learning_scheduler import (
@@ -1870,6 +1875,13 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
                   f"using Hungarian: {exc}")
             return fallback
     
+    if (scheduler_type == "SARSA" and
+            os.environ.get("SMART_FACTORY_SARSA_V3", "0") == "1"):
+        # Explicit opt-in keeps existing tabular checkpoints and other RL
+        # schedulers on their original adapters. V3 never substitutes a policy.
+        from sarsa_v3_runtime import SarsaV3Scheduler
+        return SarsaV3Scheduler(model_path, seed=seed)
+
     if scheduler_type in {"DQN", "SARSA"}:
         try:
             from rl_schedulers import (

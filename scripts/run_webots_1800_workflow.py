@@ -41,6 +41,7 @@ from graph_ppo_scheduler import (  # noqa: E402
 )
 from learning_scheduler import (  # noqa: E402
     FEATURE_VERSION, GRAPH_FEATURE_NAMES, PAIR_FEATURE_NAMES,
+    TRAFFIC_PAIR_FEATURE_NAMES, TRAFFIC_PAIR_FEATURE_VERSION, TRAFFIC_VERSION,
     WEBOTS_SHARED_SUPERVISION_VERSION,
 )
 from dual_objective import CountRewardProfile  # noqa: E402
@@ -335,6 +336,26 @@ def _valid_shared_supervision(document) -> bool:
                 int(np.count_nonzero(labels == 1.0)) != positive or
                 int(np.count_nonzero(labels == 0.0)) != negative):
             return False
+        if "traffic_ridge_by_objective" in document:
+            collection = document["traffic_ridge_by_objective"]
+            if not isinstance(collection, dict):
+                return False
+            traffic = collection.get(objective)
+            if not isinstance(traffic, dict) or (
+                    traffic.get("feature_version") != TRAFFIC_PAIR_FEATURE_VERSION or
+                    traffic.get("traffic_version") != TRAFFIC_VERSION):
+                return False
+            try:
+                traffic_x = np.asarray(traffic.get("features"), dtype=np.float64)
+                traffic_y = np.asarray(traffic.get("targets"), dtype=np.float64).reshape(-1)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            count = traffic.get("sample_count")
+            if (traffic_x.shape != (len(traffic_y), len(TRAFFIC_PAIR_FEATURE_NAMES)) or
+                    not len(traffic_y) or not np.all(np.isfinite(traffic_x)) or
+                    not np.all(np.isfinite(traffic_y)) or isinstance(count, bool) or
+                    not isinstance(count, int) or count != len(traffic_y)):
+                return False
     return True
 
 

@@ -30,6 +30,7 @@ from schedulers import (
     build_cost_matrix,
 )
 from task_generator import TransportTask
+from traffic_features import TRAFFIC_FEATURE_NAMES, TRAFFIC_VERSION, TrafficSnapshot
 
 
 FEATURE_VERSION = "factory-pair-v2-priority-horizon"
@@ -75,6 +76,17 @@ GRAPH_CONTEXT_FEATURE_NAMES = (
 )
 
 GRAPH_FEATURE_NAMES = PAIR_FEATURE_NAMES + GRAPH_CONTEXT_FEATURE_NAMES
+TRAFFIC_GRAPH_FEATURE_NAMES = GRAPH_FEATURE_NAMES + TRAFFIC_FEATURE_NAMES
+TRAFFIC_GRAPH_MODEL_VERSION = "graph-edge-imitation-v4-route-traffic"
+TRAFFIC_GRAPH_FEATURE_VERSION = "factory-graph-v3-route-traffic"
+TRAFFIC_PAIR_FEATURE_NAMES = PAIR_FEATURE_NAMES + TRAFFIC_FEATURE_NAMES + (
+    "unfloored_pair_cost",
+    "task_deadline_seconds",
+    "task_weighted_deadline_pressure",
+    "traffic_expert_penalty",
+)
+TRAFFIC_PAIR_FEATURE_VERSION = "factory-pair-v3-route-traffic-sla"
+TRAFFIC_RIDGE_MODEL_VERSION = "learned-cost-ridge-v6-route-traffic-sla"
 
 
 def _finite_number(value, default: float = 0.0) -> float:
@@ -121,7 +133,8 @@ def pair_feature_vector(robot_id: int, task: TransportTask,
                         pending_tasks: Sequence[TransportTask],
                         context: Optional[SchedulingContext] = None,
                         *, base_cost: Optional[float] = None,
-                        pending_count_override: Optional[int] = None
+                        pending_count_override: Optional[int] = None,
+                        idle_count_override: Optional[int] = None
                         ) -> np.ndarray:
     """Build the versioned, future-information-free pair feature vector."""
     context = context or SchedulingContext()
@@ -139,10 +152,11 @@ def pair_feature_vector(robot_id: int, task: TransportTask,
     base_cost = float(base_cost)
     if not math.isfinite(base_cost) or base_cost < 0:
         raise ValueError("pair has no finite non-negative baseline cost")
-    idle_count = sum(
+    idle_count = (sum(
         1 for robot in robot_states.values()
         if robot.get("state") == RobotState.IDLE and
         robot.get("current_task") is None)
+        if idle_count_override is None else max(0, int(idle_count_override)))
     pending_count = (sum(
         1 for item in pending_tasks if item.status == TaskStatus.PENDING)
         if pending_count_override is None else
@@ -193,12 +207,18 @@ def pair_feature_tensor(matrix: CostMatrix, robot_states: Dict[int, dict],
     """Return ``robots x tasks x features``; infeasible edges remain zero."""
     tensor = np.zeros(
         matrix.values.shape + (len(PAIR_FEATURE_NAMES),), dtype=np.float64)
+    idle_count = sum(1 for state in robot_states.values()
+                     if state.get("state") == RobotState.IDLE and
+                     state.get("current_task") is None)
+    pending_count = sum(task.status == TaskStatus.PENDING for task in pending_tasks)
     for row, robot_id in enumerate(matrix.robot_ids):
         for column, task in enumerate(matrix.tasks):
             if matrix.feasible[row, column]:
                 tensor[row, column] = pair_feature_vector(
                     robot_id, task, robot_states, pending_tasks, context,
-                    base_cost=float(matrix.values[row, column]))
+                    base_cost=float(matrix.values[row, column]),
+                    pending_count_override=pending_count,
+                    idle_count_override=idle_count)
     return tensor
 
 
@@ -255,6 +275,129 @@ def graph_edge_feature_tensor(matrix: CostMatrix,
     if not np.all(np.isfinite(output)):
         raise ValueError("graph feature tensor contains non-finite values")
     return output
+
+
+def _traffic_edge_values(matrix, context):
+    snapshot = context.traffic_context
+    if not isinstance(snapshot, TrafficSnapshot) or snapshot.now != context.current_time:
+        raise ValueError("traffic model requires a current, frozen traffic snapshot")
+    features = np.zeros(matrix.values.shape + (len(TRAFFIC_FEATURE_NAMES),))
+    penalties = np.zeros(matrix.values.shape)
+    for row, rid in enumerate(matrix.robot_ids):
+        for column, task in enumerate(matrix.tasks):
+            if matrix.feasible[row, column]:
+                vector = snapshot.features(rid, task.pickup_position, task.delivery_position)
+                features[row, column] = vector
+                penalties[row, column] = snapshot.expert_penalty(vector)
+    return features, penalties
+
+
+def _traffic_adjusted_pairs(matrix, pair_features, context):
+    """Share endpoint and route semantics between both learned matchers."""
+    if pair_features.shape != matrix.values.shape + (len(PAIR_FEATURE_NAMES),):
+        raise ValueError("traffic pair feature tensor has an invalid shape")
+    traffic, penalties = _traffic_edge_values(matrix, context)
+    raw = (matrix.unfloored_values if matrix.unfloored_values is not None
+           else matrix.values)
+    values = np.where(matrix.feasible, np.maximum(0.0, raw + penalties), np.inf)
+    adjusted = CostMatrix(matrix.robot_ids, matrix.tasks, values,
+                          matrix.feasible, raw + penalties)
+    pairs = pair_features.copy()
+    for column, task in enumerate(matrix.tasks):
+        pickup = context.traffic_context.endpoint_load(task.pickup_position)
+        delivery = context.traffic_context.endpoint_load(task.delivery_position)
+        for row in range(len(matrix.robot_ids)):
+            if matrix.feasible[row, column]:
+                pairs[row, column, PAIR_FEATURE_NAMES.index("baseline_pair_cost")] = values[row, column]
+                pairs[row, column, PAIR_FEATURE_NAMES.index("pickup_congestion")] = pickup
+                pairs[row, column, PAIR_FEATURE_NAMES.index("delivery_congestion")] = delivery
+    return adjusted, pairs, traffic, penalties
+
+
+def traffic_graph_feature_tensor(matrix, pair_features, context):
+    """39-feature graph contract; legacy pair features remain unchanged."""
+    adjusted, pairs, traffic, _penalties = _traffic_adjusted_pairs(
+        matrix, pair_features, context)
+    result = np.concatenate((graph_edge_feature_tensor(adjusted, pairs), traffic), axis=2)
+    if not np.all(np.isfinite(result)):
+        raise ValueError("traffic graph features must be finite")
+    return result
+
+
+def _weighted_deadline_pressure(task, now):
+    waiting = max(0.0, float(now) - float(task.arrival_time))
+    deadline = task.max_completion_time_seconds
+    pressure = min(1.0, waiting / float(deadline)) if deadline else 0.0
+    return {1: 1.0, 2: 2.0, 3: 4.0}[int(task.priority)] * pressure
+
+
+def traffic_pair_feature_tensor(matrix, pair_features, context):
+    """Ridge inputs retain raw cost and expose nonlinear expert terms explicitly."""
+    raw = matrix.unfloored_values
+    if (raw is None or raw.shape != matrix.values.shape or
+            not np.all(np.isfinite(raw[matrix.feasible]))):
+        raise ValueError("traffic Ridge features require valid unfloored costs")
+    _adjusted, pairs, traffic, penalties = _traffic_adjusted_pairs(
+        matrix, pair_features, context)
+    extra = np.zeros(matrix.values.shape + (4,), dtype=np.float64)
+    for column, task in enumerate(matrix.tasks):
+        mask = matrix.feasible[:, column]
+        extra[mask, column, 0] = raw[mask, column]
+        extra[mask, column, 1] = task.max_completion_time_seconds or 0.0
+        extra[mask, column, 2] = _weighted_deadline_pressure(task, context.current_time)
+        extra[mask, column, 3] = penalties[mask, column]
+    result = np.concatenate((pairs, traffic, extra), axis=2)
+    if not np.all(np.isfinite(result)):
+        raise ValueError("traffic Ridge features must be finite")
+    return result
+
+
+def traffic_objective_expert_values(matrix, context, objective):
+    """Preserve Count/Utility objectives, adding route-specific delay costs."""
+    values = objective_expert_values(matrix, context, objective)
+    _features, penalties = _traffic_edge_values(matrix, context)
+    values[matrix.feasible] += penalties[matrix.feasible]
+    return values
+
+
+def traffic_ridge_supervision(matrix, features, context, objective):
+    """Dense traffic cost labels from exactly the same snapshot as inference."""
+    expected = matrix.values.shape + (len(TRAFFIC_PAIR_FEATURE_NAMES),)
+    if features.shape != expected or not np.all(np.isfinite(features)):
+        raise ValueError("traffic Ridge supervision feature contract mismatch")
+    values = traffic_objective_expert_values(matrix, context, objective)
+    return {
+        "feature_version": TRAFFIC_PAIR_FEATURE_VERSION,
+        "traffic_version": TRAFFIC_VERSION,
+        "features": features[matrix.feasible].tolist(),
+        "targets": values[matrix.feasible].tolist(),
+        "sample_count": int(np.count_nonzero(matrix.feasible)),
+    }
+
+
+def traffic_graph_supervision(matrix, graph_features, context, objective,
+                              behavior_coordinate=None):
+    expected = matrix.values.shape + (len(TRAFFIC_GRAPH_FEATURE_NAMES),)
+    if graph_features.shape != expected:
+        raise ValueError("traffic graph supervision feature contract mismatch")
+    costs = traffic_objective_expert_values(matrix, context, objective)
+    positives = sorted(solve_hungarian(costs, matrix.feasible))
+    positive_set = set(positives)
+    negatives = [tuple(map(int, value)) for value in np.argwhere(matrix.feasible)
+                 if tuple(map(int, value)) not in positive_set]
+    negatives.sort(key=lambda value: (float(costs[value]), value))
+    if behavior_coordinate in negatives:
+        negatives.remove(behavior_coordinate)
+        negatives.insert(0, behavior_coordinate)
+    coordinates = positives + negatives[:max(4, 3 * len(positives))]
+    return {
+        "feature_version": TRAFFIC_GRAPH_FEATURE_VERSION,
+        "traffic_version": TRAFFIC_VERSION,
+        "features": [graph_features[value].tolist() for value in coordinates],
+        "labels": [float(value in positive_set) for value in coordinates],
+        "positive_count": len(positives),
+        "negative_count": len(coordinates) - len(positives),
+    }
 
 
 def _validate_training_arrays(features, targets, feature_count: int):
@@ -327,11 +470,33 @@ class RidgeCostModel:
     training_samples: int
     target_name: str = "execution_time"
 
+    @property
+    def uses_traffic(self):
+        return len(self.coefficients) == len(TRAFFIC_PAIR_FEATURE_NAMES)
+
+    @property
+    def feature_names(self):
+        return TRAFFIC_PAIR_FEATURE_NAMES if self.uses_traffic else PAIR_FEATURE_NAMES
+
+    @property
+    def feature_version(self):
+        return TRAFFIC_PAIR_FEATURE_VERSION if self.uses_traffic else FEATURE_VERSION
+
+    @property
+    def model_version(self):
+        return TRAFFIC_RIDGE_MODEL_VERSION if self.uses_traffic else RIDGE_MODEL_VERSION
+
     @classmethod
     def fit(cls, features, targets, *, l2: float = 1.0,
             target_name: str = "execution_time"):
-        x, y = _validate_training_arrays(
-            features, targets, len(PAIR_FEATURE_NAMES))
+        supplied = np.asarray(features)
+        if supplied.ndim != 2 or supplied.shape[1] not in (
+                len(PAIR_FEATURE_NAMES), len(TRAFFIC_PAIR_FEATURE_NAMES)):
+            raise ValueError("unsupported learned-cost training feature contract")
+        x, y = _validate_training_arrays(features, targets, supplied.shape[1])
+        if (supplied.shape[1] == len(TRAFFIC_PAIR_FEATURE_NAMES) and
+                target_name not in {"count_expert_cost", "utility_v2_expert_cost"}):
+            raise ValueError("traffic Ridge requires objective expert cost targets")
         if not math.isfinite(l2) or l2 < 0:
             raise ValueError("l2 must be finite and non-negative")
         supported_targets = {
@@ -366,7 +531,7 @@ class RidgeCostModel:
         single = x.ndim == 1
         if single:
             x = x.reshape(1, -1)
-        if x.ndim != 2 or x.shape[1] != len(PAIR_FEATURE_NAMES):
+        if x.ndim != 2 or x.shape[1] != len(self.feature_names):
             raise ValueError("prediction feature dimension is incompatible")
         if not np.all(np.isfinite(x)):
             raise ValueError("prediction features must be finite")
@@ -379,13 +544,15 @@ class RidgeCostModel:
 
     def save(self, path) -> None:
         metadata = {
-            "model_version": RIDGE_MODEL_VERSION,
-            "feature_version": FEATURE_VERSION,
+            "model_version": self.model_version,
+            "feature_version": self.feature_version,
             "environment_version": RL_ENVIRONMENT_VERSION,
-            "feature_names": list(PAIR_FEATURE_NAMES),
+            "feature_names": list(self.feature_names),
             "training_samples": int(self.training_samples),
             "target_name": self.target_name,
         }
+        if self.uses_traffic:
+            metadata["traffic_version"] = TRAFFIC_VERSION
         _atomic_save_npz(
             path, metadata=_metadata_array(metadata), mean=self.mean,
             scale=self.scale, coefficients=self.coefficients,
@@ -395,11 +562,15 @@ class RidgeCostModel:
     def load(cls, path):
         archive = _load_archive(path)
         metadata = _read_metadata(archive)
-        if metadata.get("model_version") != RIDGE_MODEL_VERSION:
+        traffic = metadata.get("model_version") == TRAFFIC_RIDGE_MODEL_VERSION
+        if metadata.get("model_version") not in (RIDGE_MODEL_VERSION, TRAFFIC_RIDGE_MODEL_VERSION):
             raise ModelValidationError("unsupported learned-cost model version")
+        names = TRAFFIC_PAIR_FEATURE_NAMES if traffic else PAIR_FEATURE_NAMES
+        version = TRAFFIC_PAIR_FEATURE_VERSION if traffic else FEATURE_VERSION
         if (metadata.get("environment_version") != RL_ENVIRONMENT_VERSION or
-                metadata.get("feature_version") != FEATURE_VERSION or
-                tuple(metadata.get("feature_names", ())) != PAIR_FEATURE_NAMES):
+                metadata.get("feature_version") != version or
+                tuple(metadata.get("feature_names", ())) != names or
+                (traffic and metadata.get("traffic_version") != TRAFFIC_VERSION)):
             raise ModelValidationError("learned-cost feature contract mismatch")
         required = {"mean", "scale", "coefficients", "intercept"}
         if not required.issubset(archive):
@@ -408,7 +579,7 @@ class RidgeCostModel:
         scale = np.asarray(archive["scale"], dtype=np.float64).reshape(-1)
         coefficients = np.asarray(
             archive["coefficients"], dtype=np.float64).reshape(-1)
-        size = len(PAIR_FEATURE_NAMES)
+        size = len(names)
         if mean.shape != (size,) or scale.shape != (size,) or \
                 coefficients.shape != (size,):
             raise ModelValidationError("learned-cost parameter shape mismatch")
@@ -423,6 +594,8 @@ class RidgeCostModel:
                 "execution_time", "baseline_pair_cost",
                 "count_expert_cost", "utility_v2_expert_cost"}:
             raise ModelValidationError("unsupported learned-cost target")
+        if traffic and target_name not in {"count_expert_cost", "utility_v2_expert_cost"}:
+            raise ModelValidationError("traffic Ridge requires objective expert cost targets")
         return cls(mean, scale, coefficients, intercept,
                    int(metadata.get("training_samples", 0)), target_name)
 
@@ -435,11 +608,27 @@ class GraphEdgeImitationModel:
     intercept: float
     training_samples: int
 
+    @property
+    def uses_traffic(self):
+        return len(self.weights) == len(TRAFFIC_GRAPH_FEATURE_NAMES)
+
+    @property
+    def feature_names(self):
+        return TRAFFIC_GRAPH_FEATURE_NAMES if self.uses_traffic else GRAPH_FEATURE_NAMES
+
+    @property
+    def model_version(self):
+        return TRAFFIC_GRAPH_MODEL_VERSION if self.uses_traffic else GRAPH_MODEL_VERSION
+
     @classmethod
     def fit(cls, features, labels, *, epochs: int = 500,
             learning_rate: float = 0.05, l2: float = 1e-4):
+        supplied = np.asarray(features)
+        if supplied.ndim != 2 or supplied.shape[1] not in (
+                len(GRAPH_FEATURE_NAMES), len(TRAFFIC_GRAPH_FEATURE_NAMES)):
+            raise ValueError("unsupported graph training feature contract")
         x, y = _validate_training_arrays(
-            features, labels, len(GRAPH_FEATURE_NAMES))
+            features, labels, supplied.shape[1])
         if np.any((y != 0.0) & (y != 1.0)):
             raise ValueError("imitation labels must be binary")
         if not np.any(y == 1.0) or not np.any(y == 0.0):
@@ -472,7 +661,7 @@ class GraphEdgeImitationModel:
         single = x.ndim == 1
         if single:
             x = x.reshape(1, -1)
-        if x.ndim != 2 or x.shape[1] != len(GRAPH_FEATURE_NAMES):
+        if x.ndim != 2 or x.shape[1] != len(self.feature_names):
             raise ValueError("graph prediction feature dimension is incompatible")
         if not np.all(np.isfinite(x)):
             raise ValueError("graph prediction features must be finite")
@@ -486,10 +675,11 @@ class GraphEdgeImitationModel:
 
     def save(self, path) -> None:
         metadata = {
-            "model_version": GRAPH_MODEL_VERSION,
-            "feature_version": FEATURE_VERSION,
+            "model_version": self.model_version,
+            "feature_version": (TRAFFIC_GRAPH_FEATURE_VERSION
+                                if self.uses_traffic else FEATURE_VERSION),
             "environment_version": RL_ENVIRONMENT_VERSION,
-            "feature_names": list(GRAPH_FEATURE_NAMES),
+            "feature_names": list(self.feature_names),
             "training_samples": int(self.training_samples),
         }
         _atomic_save_npz(
@@ -501,11 +691,15 @@ class GraphEdgeImitationModel:
     def load(cls, path):
         archive = _load_archive(path)
         metadata = _read_metadata(archive)
-        if metadata.get("model_version") != GRAPH_MODEL_VERSION:
+        traffic = metadata.get("model_version") == TRAFFIC_GRAPH_MODEL_VERSION
+        if metadata.get("model_version") not in (
+                GRAPH_MODEL_VERSION, TRAFFIC_GRAPH_MODEL_VERSION):
             raise ModelValidationError("unsupported graph imitation model version")
+        names = TRAFFIC_GRAPH_FEATURE_NAMES if traffic else GRAPH_FEATURE_NAMES
+        version = TRAFFIC_GRAPH_FEATURE_VERSION if traffic else FEATURE_VERSION
         if (metadata.get("environment_version") != RL_ENVIRONMENT_VERSION or
-                metadata.get("feature_version") != FEATURE_VERSION or
-                tuple(metadata.get("feature_names", ())) != GRAPH_FEATURE_NAMES):
+                metadata.get("feature_version") != version or
+                tuple(metadata.get("feature_names", ())) != names):
             raise ModelValidationError("graph feature contract mismatch")
         required = {"mean", "scale", "weights", "intercept"}
         if not required.issubset(archive):
@@ -513,7 +707,7 @@ class GraphEdgeImitationModel:
         mean = np.asarray(archive["mean"], dtype=np.float64).reshape(-1)
         scale = np.asarray(archive["scale"], dtype=np.float64).reshape(-1)
         weights = np.asarray(archive["weights"], dtype=np.float64).reshape(-1)
-        size = len(GRAPH_FEATURE_NAMES)
+        size = len(names)
         if mean.shape != (size,) or scale.shape != (size,) or \
                 weights.shape != (size,):
             raise ModelValidationError("graph parameter shape mismatch")
@@ -596,12 +790,7 @@ def objective_expert_values(matrix: CostMatrix,
             # expensive after the operational max(0, cost) lost information.
             values[:, column] += priority_bonus + waiting_bonus
             continue
-        priority_weight = {1: 1.0, 2: 2.0, 3: 4.0}[int(task.priority)]
-        deadline = task.max_completion_time_seconds
-        pressure = 0.0
-        if deadline is not None and deadline > 0:
-            pressure = min(1.0, max(0.0, waiting / float(deadline)))
-        values[:, column] -= 2.0 * priority_weight * pressure
+        values[:, column] -= 2.0 * _weighted_deadline_pressure(task, now)
     if not np.all(np.isfinite(values[matrix.feasible])):
         raise ValueError("objective expert produced non-finite feasible costs")
     return values
@@ -759,6 +948,17 @@ def physical_supervision_snapshot(
     batches = objective_supervision_batches(
         matrix, pair_features, graph_features, context,
         behavior_coordinate=(selected_row, selected_column))
+    if isinstance(context.traffic_context, TrafficSnapshot):
+        ridge_features = traffic_pair_feature_tensor(matrix, pair_features, context)
+        batches["traffic_ridge_by_objective"] = {
+            objective: traffic_ridge_supervision(matrix, ridge_features, context, objective)
+            for objective in ("count", "utility_v2")}
+        traffic_features = traffic_graph_feature_tensor(matrix, pair_features, context)
+        batches["traffic_graph_by_objective"] = {
+            objective: traffic_graph_supervision(
+                matrix, traffic_features, context, objective,
+                (selected_row, selected_column))
+            for objective in ("count", "utility_v2")}
     return {
         "schema_version": 2,
         "dataset_version": WEBOTS_SHARED_SUPERVISION_VERSION,
@@ -791,6 +991,10 @@ class LearnedCostHungarianScheduler(_LearnedMatchingScheduler):
         self.model_path = str(model_path) if model_path is not None else ""
         self.model = RidgeCostModel.load(model_path)
 
+    @property
+    def uses_traffic(self):
+        return self.model.uses_traffic
+
     def assign(self, pending_tasks, robot_states,
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
@@ -805,9 +1009,11 @@ class LearnedCostHungarianScheduler(_LearnedMatchingScheduler):
         if base.values.size == 0 or not np.any(base.feasible):
             return _result_from_matching(
                 self.name, base, [], pending_tasks, robot_states, context,
-                started, {"model_version": RIDGE_MODEL_VERSION})
+                started, {"model_version": self.model.model_version})
         features = pair_feature_tensor(
             base, robot_states, pending_tasks, context)
+        if self.uses_traffic:
+            features = traffic_pair_feature_tensor(base, features, context)
         learned_values = learned_cost_values(
             self.model, base, features, context)
         learned = CostMatrix(
@@ -820,7 +1026,9 @@ class LearnedCostHungarianScheduler(_LearnedMatchingScheduler):
             pairs = pairs[:1]
         diagnostics = {
             "solver": "scipy.linear_sum_assignment",
-            "model_version": RIDGE_MODEL_VERSION,
+            "model_version": self.model.model_version,
+            "feature_version": self.model.feature_version,
+            "traffic_version": TRAFFIC_VERSION if self.uses_traffic else None,
             "training_samples": self.model.training_samples,
             "target_name": self.model.target_name,
         }
@@ -848,6 +1056,10 @@ class GraphImitationScheduler(_LearnedMatchingScheduler):
         self.model_path = str(model_path) if model_path is not None else ""
         self.model = GraphEdgeImitationModel.load(model_path)
 
+    @property
+    def uses_traffic(self):
+        return self.model.uses_traffic
+
     def assign(self, pending_tasks, robot_states,
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
@@ -862,10 +1074,12 @@ class GraphImitationScheduler(_LearnedMatchingScheduler):
         if base.values.size == 0 or not np.any(base.feasible):
             return _result_from_matching(
                 self.name, base, [], pending_tasks, robot_states, context,
-                started, {"model_version": GRAPH_MODEL_VERSION})
+                started, {"model_version": self.model.model_version})
         pair_features = pair_feature_tensor(
             base, robot_states, pending_tasks, context)
-        graph_features = graph_edge_feature_tensor(base, pair_features)
+        graph_features = (traffic_graph_feature_tensor(base, pair_features, context)
+                          if self.uses_traffic else
+                          graph_edge_feature_tensor(base, pair_features))
         learned_values, probability_matrix = graph_imitation_values(
             self.model, base, graph_features)
         learned = CostMatrix(
@@ -878,7 +1092,7 @@ class GraphImitationScheduler(_LearnedMatchingScheduler):
             pairs = pairs[:1]
         diagnostics = {
             "solver": "scipy.linear_sum_assignment",
-            "model_version": GRAPH_MODEL_VERSION,
+            "model_version": self.model.model_version,
             "training_samples": self.model.training_samples,
             "mean_selected_probability": float(np.mean([
                 probability_matrix[row, column]
@@ -888,8 +1102,9 @@ class GraphImitationScheduler(_LearnedMatchingScheduler):
             selected_row, selected_column = pairs[0]
             objective = os.environ.get(
                 "SMART_FACTORY_FINE_TUNE_OBJECTIVE", "utility_v2").strip()
-            expert_values = objective_expert_values(
-                base, context, objective)
+            expert_values = (traffic_objective_expert_values(base, context, objective)
+                             if self.uses_traffic else
+                             objective_expert_values(base, context, objective))
             expert = set(solve_hungarian(expert_values, base.feasible))
             coordinates = [tuple(map(int, value)) for value in
                            np.argwhere(base.feasible)]

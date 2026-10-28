@@ -46,7 +46,7 @@ from config import SCENARIOS, NUM_REPEATS
 SCHEDULER_TYPES = [
     "FCFS", "NearestNeighbour", "RoundRobin", "Greedy", "Random",
     "Hungarian", "Auction", "GA", "SA", "LearnedHungarian",
-    "GraphImitation", "GraphPPO", "RainbowDQN", "QRDQN", "CQL",
+    "GraphImitation", "GraphExpert", "TrafficHungarian", "GraphPPO", "RainbowDQN", "QRDQN", "CQL",
     "LinUCB", "PPO_RL", "SARSA", "DQN"]
 SCENARIO_KEYS = ["A", "B", "C"]
 RANDOM_SEEDS = [42, 123, 456, 789, 1024]
@@ -1485,6 +1485,7 @@ def main() -> int:
     parser.add_argument("--ppo-model")
     parser.add_argument("--learned-cost-model")
     parser.add_argument("--graph-imitation-model")
+    parser.add_argument("--graph-expert-model", help="Evaluation-only expert JSON descriptor")
     parser.add_argument("--graph-ppo-model")
     parser.add_argument("--rainbow-dqn-model")
     parser.add_argument("--qrdqn-model")
@@ -1522,6 +1523,8 @@ def main() -> int:
                 ("PPO_RL", args.ppo_model),
                 ("LearnedHungarian", args.learned_cost_model),
                 ("GraphImitation", args.graph_imitation_model),
+                ("GraphExpert", args.graph_expert_model),
+                ("TrafficHungarian", args.graph_expert_model),
                 ("GraphPPO", args.graph_ppo_model),
                 ("RainbowDQN", args.rainbow_dqn_model),
                 ("QRDQN", args.qrdqn_model),

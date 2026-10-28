@@ -21,8 +21,12 @@ from task_generator import (TransportTask, canonical_task_manifest_document,
                             generate_task_manifest, tasks_from_manifest)
 
 
+from collections import OrderedDict
+
+
 _STATIC_COORDINATORS = {}
 _SEGMENT_CACHES = {}
+_ROUTE_CACHES = {}
 
 
 def formal_scenario_config(scenario_id: str) -> dict:
@@ -112,6 +116,7 @@ class FactoryAStarCostOracle:
             _SEGMENT_CACHES[num_robots] = {}
         self.coordinator = _STATIC_COORDINATORS[num_robots]
         self.cache = _SEGMENT_CACHES[num_robots]
+        self.route_cache = _ROUTE_CACHES.setdefault(num_robots, OrderedDict())
 
     def bind_robot_states(self, robot_states: Dict[int, dict]):
         """Rebind to the live/deep-copied simulator snapshot."""
@@ -134,9 +139,25 @@ class FactoryAStarCostOracle:
             return 0.0
         key = (start, goal)
         if key not in self.cache:
-            path = self.coordinator.grid_planner.plan(start, goal, smooth=True)
+            path = self.segment_route(start, goal)
             self.cache[key] = path_length(path, start)
         return self.cache[key]
+
+    def segment_route(self, start, goal):
+        """Return cached static geometry without touching execution reservations."""
+        start, goal = tuple(map(float, start)), tuple(map(float, goal))
+        if math.dist(start, goal) <= GOAL_TOLERANCE * 2.5:
+            return (start, goal)
+        key = (start, goal)
+        if key in self.route_cache:
+            self.route_cache.move_to_end(key)
+            return self.route_cache[key]
+        path = self.coordinator.grid_planner.plan(start, goal, smooth=True)
+        result = None if path is None else tuple(tuple(point) for point in path)
+        self.route_cache[key] = result
+        if len(self.route_cache) > 4096:
+            self.route_cache.popitem(last=False)
+        return result
 
     def __call__(self, robot_id: int, task: TransportTask) -> float:
         empty = self.segment(

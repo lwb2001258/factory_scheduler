@@ -61,3 +61,25 @@ Reviewed source SHA-256:
 ```text
 1B04F9B8F790E911EF4CCAC582EEE94AEAFF2639D28644567721ED153A3D9A11  controllers/factory_supervisor/sarsa_v4_agent.py
 ```
+
+## Step 4 — commit-aware runtime and Supervisor integration
+
+- Review A (algorithm/semantics): passed.  Transitions close only after an
+  actual commit, rejection, or policy WAIT.  Event rewards remain conserved,
+  rejection/defer penalties attach to the action that caused them, and terminal
+  finalization flushes all pending n-step samples before the checkpoint.
+- Review B (runtime/resume): passed.  V4 has an explicit environment switch and
+  output path, simultaneous v3/v4 switches fail closed, incompatible V4 models
+  never fall back to another scheduler, output is confined to the run root, and
+  frozen evaluation rejects any model-state change.
+- Review C (tests/final diff): passed.  Commit/reject/terminal and frozen-eval
+  smoke tests passed; 55 legacy SARSA/advanced scheduler tests passed; factory
+  opt-in/fail-closed, AST compilation, and `git diff --check` passed.
+
+Reviewed source SHA-256:
+
+```text
+3194EE0AC411FFE25A783EBE6FE6DB7CF9F8E74CDB6B18510B9C657011846952  controllers/factory_supervisor/sarsa_v4_runtime.py
+24183DEC831AB49CF6FD83DF573A8D9267BF89835DB3B9CB6372F1EA263D5F77  controllers/factory_supervisor/schedulers.py
+904676A605FCF9313E7EFB4C17124619BCF74F280B0B25C8F37812B20A41A4D9  controllers/factory_supervisor/factory_supervisor.py
+```

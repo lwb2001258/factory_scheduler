@@ -1875,8 +1875,16 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
                   f"using Hungarian: {exc}")
             return fallback
     
-    if (scheduler_type == "SARSA" and
-            os.environ.get("SMART_FACTORY_SARSA_V3", "0") == "1"):
+    sarsa_v4 = os.environ.get("SMART_FACTORY_SARSA_V4", "0") == "1"
+    sarsa_v3 = os.environ.get("SMART_FACTORY_SARSA_V3", "0") == "1"
+    if scheduler_type == "SARSA" and sarsa_v4 and sarsa_v3:
+        raise ModelValidationError("SARSA v3 and v4 cannot both be enabled")
+
+    if scheduler_type == "SARSA" and sarsa_v4:
+        from sarsa_v4_runtime import SarsaV4Scheduler
+        return SarsaV4Scheduler(model_path, seed=seed)
+
+    if scheduler_type == "SARSA" and sarsa_v3:
         # Explicit opt-in keeps existing tabular checkpoints and other RL
         # schedulers on their original adapters. V3 never substitutes a policy.
         from sarsa_v3_runtime import SarsaV3Scheduler

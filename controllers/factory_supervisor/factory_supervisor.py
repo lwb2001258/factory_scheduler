@@ -2758,7 +2758,13 @@ class FactorySupervisor:
         }
         if getattr(self.scheduler, "graph_expert", False):
             result["graph_expert"] = self.scheduler.evaluation_metadata()
-        if getattr(self.scheduler, "sarsa_v3", False):
+        if getattr(self.scheduler, "sarsa_v4", False):
+            result["sarsa_v4"] = self.scheduler.finalize(
+                tasks, float(SIM_DURATION), self.metrics.physical_collision_count,
+                utility_profile=self._utility_reward_profile,
+                output_path=os.environ.get(
+                    "SMART_FACTORY_SARSA_V4_OUTPUT_MODEL") or None)
+        elif getattr(self.scheduler, "sarsa_v3", False):
             result["sarsa_v3"] = self.scheduler.finalize(
                 tasks, float(SIM_DURATION), self.metrics.physical_collision_count,
                 utility_profile=self._utility_reward_profile,
@@ -6393,7 +6399,8 @@ class FactorySupervisor:
         if not getattr(self, "system_ready", True) or getattr(
                 self, "startup_failed", False):
             return
-        if getattr(self.scheduler, "sarsa_v3", False):
+        if (getattr(self.scheduler, "sarsa_v4", False) or
+                getattr(self.scheduler, "sarsa_v3", False)):
             self.scheduler.observe(
                 self.task_generator.tasks_generated, self.sim_time,
                 self.metrics.physical_collision_count,

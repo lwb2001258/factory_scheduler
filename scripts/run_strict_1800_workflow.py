@@ -74,11 +74,16 @@ from headless_training_runtime import (  # noqa: E402
 )
 from learning_scheduler import (  # noqa: E402
     FEATURE_VERSION, GRAPH_FEATURE_NAMES, PAIR_FEATURE_NAMES,
+    TRAFFIC_GRAPH_FEATURE_NAMES, TRAFFIC_GRAPH_FEATURE_VERSION,
+    TRAFFIC_PAIR_FEATURE_NAMES, TRAFFIC_PAIR_FEATURE_VERSION, TRAFFIC_VERSION,
     WEBOTS_SHARED_SUPERVISION_VERSION,
     GraphEdgeImitationModel, RidgeCostModel,
     graph_edge_feature_tensor, graph_imitation_values,
     learned_cost_values, objective_expert_values,
     objective_supervision_batches, pair_feature_tensor, solve_hungarian,
+    traffic_graph_feature_tensor, traffic_graph_supervision,
+    traffic_objective_expert_values,
+    traffic_pair_feature_tensor, traffic_ridge_supervision,
 )
 from rl_agents import (  # noqa: E402
     DQNAgent, DQNConfig, DQN_MODEL_VERSION, SarsaAgent, SarsaConfig,
@@ -390,6 +395,8 @@ def training_config_sha256(spec: dict) -> str:
         "parameters": training_parameters(spec),
         "trial_config_sha256": spec.get("trial_config_sha256"),
     }
+    if spec.get("traffic_version"):
+        payload["traffic_version"] = spec["traffic_version"]
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"),
         ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
@@ -779,9 +786,17 @@ def load_model(spec: dict, path: Path, seed: int, *,
     state_dim, action_dim, no_op = _dimensions()
     name = spec["scheduler"]
     if name == "LearnedHungarian":
-        return RidgeCostModel.load(path)
+        model = RidgeCostModel.load(path)
+        if model.uses_traffic != bool(spec.get("traffic_version")):
+            raise ModelValidationError("Ridge traffic training contract mismatch")
+        if model.uses_traffic and model.target_name != f"{spec['objective']}_expert_cost":
+            raise ModelValidationError("Ridge objective target mismatch")
+        return model
     if name == "GraphImitation":
-        return GraphEdgeImitationModel.load(path)
+        model = GraphEdgeImitationModel.load(path)
+        if model.uses_traffic != bool(spec.get("traffic_version")):
+            raise ModelValidationError("graph traffic training contract mismatch")
+        return model
     if name == "GraphPPO":
         return GraphPPOModel.load(path, seed=seed)
     if name in ADVANCED_VALUE:
@@ -1040,19 +1055,32 @@ def atomic_supervised_samples(path: Path, kind: str, features,
     allowed_kinds = {
         "ridge_count_expert_cost",
         "ridge_utility_v2_expert_cost",
+        "ridge_count_expert_cost_traffic_v1",
+        "ridge_utility_v2_expert_cost_traffic_v1",
         "graph_count_imitation",
         "graph_utility_v2_imitation",
+        "graph_count_imitation_traffic_v1",
+        "graph_utility_v2_imitation_traffic_v1",
     }
     if (kind not in allowed_kinds or
             x.ndim != 2 or x.shape[0] != y.shape[0] or not len(y) or
             not np.all(np.isfinite(x)) or not np.all(np.isfinite(y))):
         raise ValueError("invalid supervised standalone samples")
+    ridge_traffic = kind.startswith("ridge_") and kind.endswith("_traffic_v1")
+    if ridge_traffic and x.shape[1] != len(TRAFFIC_PAIR_FEATURE_NAMES):
+        raise ValueError("invalid traffic Ridge sample contract")
+    if kind.startswith("graph_") and kind.endswith("_traffic_v1") and (
+            x.shape[1] != len(TRAFFIC_GRAPH_FEATURE_NAMES) or
+            not np.all(np.isin(y, (0.0, 1.0)))):
+        raise ValueError("invalid traffic supervised sample contract")
     temporary = path.with_name(path.stem + ".tmp" + path.suffix)
     try:
         with temporary.open("wb") as stream:
             np.savez_compressed(
                 stream, kind=np.asarray(kind, dtype=np.str_),
-                features=x, targets=y)
+                features=x, targets=y,
+                **({"feature_version": np.asarray(TRAFFIC_PAIR_FEATURE_VERSION),
+                    "traffic_version": np.asarray(TRAFFIC_VERSION)} if ridge_traffic else {}))
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -1063,11 +1091,23 @@ def _load_supervised_samples(path: Path, expected_kind: str):
         kind = str(archive["kind"].item())
         features = np.asarray(archive["features"], dtype=np.float64)
         targets = np.asarray(archive["targets"], dtype=np.float64).reshape(-1)
+        if kind.startswith("ridge_") and kind.endswith("_traffic_v1"):
+            if ("feature_version" not in archive or "traffic_version" not in archive or
+                    str(archive["feature_version"].item()) != TRAFFIC_PAIR_FEATURE_VERSION or
+                    str(archive["traffic_version"].item()) != TRAFFIC_VERSION):
+                raise ValueError("traffic Ridge sample version mismatch")
     if (kind != expected_kind or features.ndim != 2 or
             features.shape[0] != targets.shape[0] or not len(targets) or
             not np.all(np.isfinite(features)) or
             not np.all(np.isfinite(targets))):
         raise ValueError("invalid supervised sample artifact")
+    if kind.startswith("ridge_") and kind.endswith("_traffic_v1") and (
+            features.shape[1] != len(TRAFFIC_PAIR_FEATURE_NAMES)):
+        raise ValueError("invalid traffic Ridge sample contract")
+    if kind.startswith("graph_") and kind.endswith("_traffic_v1") and (
+            features.shape[1] != len(TRAFFIC_GRAPH_FEATURE_NAMES) or
+            not np.all(np.isin(targets, (0.0, 1.0)))):
+        raise ValueError("invalid traffic supervised sample contract")
     return features, targets
 
 
@@ -1696,6 +1736,8 @@ def _supervised_behavior_pairs(name: str, model, matrix,
                                context) -> tuple[tuple[int, int], ...]:
     """Decode the current learned model exactly as its scheduler does."""
     if name == "LearnedHungarian":
+        if model.uses_traffic:
+            pair_features = traffic_pair_feature_tensor(matrix, pair_features, context)
         values = learned_cost_values(model, matrix, pair_features, context)
     elif name == "GraphImitation":
         values, _probabilities = graph_imitation_values(
@@ -1864,6 +1906,7 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
     rollout metric attached to the policy that actually generated it.
     """
     name = spec["scheduler"]
+    uses_traffic = bool(spec.get("traffic_version"))
     if Path(input_checkpoint).resolve() == Path(spec["source"]).resolve():
         # Supervised policies bootstrap only from labels collected in this new
         # run; no prior candidate parameters or samples are loaded.
@@ -1874,6 +1917,9 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
     bootstrap_expert = model is None
     environment, robots, tasks, context, step_limit, profile = (
         _episode_environment(manifest, scenario, seed, spec["objective"]))
+    if uses_traffic:
+        context = replace(context, configuration={
+            **context.configuration, "graph_traffic_enabled": True})
     _state, metadata = environment.reset(robots, tasks, context, seed=seed)
     if metadata["reward_profile_hash"] != profile.sha256:
         raise RuntimeError("supervised training reward profile mismatch")
@@ -1894,10 +1940,11 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
                 list(live_tasks), live_robots, live_context)
             pair_features = pair_feature_tensor(
                 matrix, live_robots, list(live_tasks), live_context)
-            edge_features = graph_edge_feature_tensor(
-                matrix, pair_features)
-            expert_values = objective_expert_values(
-                matrix, live_context, spec["objective"])
+            edge_features = (None if name == "LearnedHungarian" and uses_traffic else
+                             traffic_graph_feature_tensor(matrix, pair_features, live_context)
+                             if uses_traffic else graph_edge_feature_tensor(matrix, pair_features))
+            expert_values = (traffic_objective_expert_values(matrix, live_context, spec["objective"])
+                             if uses_traffic else objective_expert_values(matrix, live_context, spec["objective"]))
             expert_pairs = tuple(solve_hungarian(
                 expert_values, matrix.feasible))
             if not expert_pairs:
@@ -1910,9 +1957,19 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
                 raise RuntimeError(
                     f"{name} learned behavior produced no assignment")
             selected_row, selected_column = behavior_pairs[0]
-            supervision = objective_supervision_batches(
-                matrix, pair_features, edge_features, live_context,
-                behavior_coordinate=(selected_row, selected_column))
+            if uses_traffic and name == "LearnedHungarian":
+                ridge_features = traffic_pair_feature_tensor(matrix, pair_features, live_context)
+                supervision = {"ridge_by_objective": {spec["objective"]:
+                    traffic_ridge_supervision(matrix, ridge_features, live_context, spec["objective"])}}
+            elif uses_traffic:
+                supervision = {"graph_by_objective": {spec["objective"]:
+                    traffic_graph_supervision(
+                        matrix, edge_features, live_context, spec["objective"],
+                        (selected_row, selected_column))}}
+            else:
+                supervision = objective_supervision_batches(
+                    matrix, pair_features, edge_features, live_context,
+                    behavior_coordinate=(selected_row, selected_column))
             if name == "LearnedHungarian":
                 batch = supervision["ridge_by_objective"][spec["objective"]]
                 feature_batches.append(np.asarray(
@@ -1954,10 +2011,10 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
     targets = np.concatenate(target_batches)
     if name == "LearnedHungarian":
         target_name = f"{spec['objective']}_expert_cost"
-        kind = f"ridge_{target_name}"
+        kind = f"ridge_{target_name}" + ("_traffic_v1" if uses_traffic else "")
     elif name == "GraphImitation":
         target_name = None
-        kind = f"graph_{spec['objective']}_imitation"
+        kind = f"graph_{spec['objective']}_imitation" + ("_traffic_v1" if uses_traffic else "")
     else:
         raise ValueError("unsupported supervised policy")
     if features.ndim != 2 or len(features) < 2:
@@ -1966,7 +2023,9 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
     fit_sample_count = 0
     if requires_refit:
         sample_limit = 200_000 if name == "LearnedHungarian" else 50_000
-        feature_dim = (len(PAIR_FEATURE_NAMES) if name == "LearnedHungarian"
+        feature_dim = (len(TRAFFIC_PAIR_FEATURE_NAMES) if name == "LearnedHungarian" and uses_traffic
+                       else len(PAIR_FEATURE_NAMES) if name == "LearnedHungarian"
+                       else len(TRAFFIC_GRAPH_FEATURE_NAMES) if uses_traffic
                        else len(GRAPH_FEATURE_NAMES))
         fit_features, fit_targets = _bounded_supervised_artifacts(
             prior_sample_paths, features, targets, kind=kind,
@@ -2186,6 +2245,8 @@ def _valid_headless_record(record, spec: dict, episode_index: int,
             f"ridge_{spec['objective']}_expert_cost" if
             spec["scheduler"] == "LearnedHungarian" else
             f"graph_{spec['objective']}_imitation")
+        if spec.get("traffic_version"):
+            expected_kind += "_traffic_v1"
         try:
             features, targets = _load_supervised_samples(
                 transitions, expected_kind)
@@ -2368,6 +2429,9 @@ def _run_standalone_validation_episode(spec: dict, checkpoint: Path,
     environment, robots, tasks, context, step_limit, profile = (
         _episode_environment(
             manifest, scenario, seed, spec["objective"]))
+    if getattr(scheduler, "uses_traffic", False):
+        context = replace(context, configuration={
+            **context.configuration, "graph_traffic_enabled": True})
     _state, metadata = environment.reset(robots, tasks, context, seed=seed)
     if metadata.get("reward_profile_hash") != profile.sha256:
         raise RuntimeError("standalone validation reward profile mismatch")
@@ -4342,7 +4406,8 @@ def _load_supervision_envelope(value) -> dict:
 
 def _learned_hungarian_shared_samples(
         envelopes: list[dict | Path], objective: str, *,
-        sample_limit: int | None = None):
+        sample_limit: int | None = None, traffic: bool = False):
+    names = TRAFFIC_PAIR_FEATURE_NAMES if traffic else PAIR_FEATURE_NAMES
     feature_batches = []
     target_batches = []
     raw_sample_count = 0
@@ -4359,15 +4424,19 @@ def _learned_hungarian_shared_samples(
             "physical_fine_tune"]
         for row in physical["rollout"]:
             supervision = _shared_supervision(row)
-            batch = supervision["ridge_by_objective"].get(objective)
+            field = "traffic_ridge_by_objective" if traffic else "ridge_by_objective"
+            batch = supervision.get(field, {}).get(objective)
             if not isinstance(batch, dict):
                 raise RuntimeError(
                     "LearnedHungarian objective supervision is missing")
+            if traffic and (batch.get("feature_version") != TRAFFIC_PAIR_FEATURE_VERSION or
+                            batch.get("traffic_version") != TRAFFIC_VERSION):
+                raise RuntimeError("LearnedHungarian traffic supervision version mismatch")
             features = np.asarray(batch.get("features"), dtype=np.float64)
             targets = np.asarray(
                 batch.get("targets"), dtype=np.float64).reshape(-1)
             if (features.shape !=
-                    (len(targets), len(PAIR_FEATURE_NAMES)) or
+                    (len(targets), len(names)) or
                     not len(targets) or
                     not np.all(np.isfinite(features)) or
                     not np.all(np.isfinite(targets))):
@@ -4387,7 +4456,7 @@ def _learned_hungarian_shared_samples(
             quota = max(2, (sample_limit - retained) // envelopes_left)
             features, targets = _bounded_supervised_batches(
                 episode_features, episode_targets, sample_limit=quota,
-                feature_dim=len(PAIR_FEATURE_NAMES))
+                feature_dim=len(names))
             feature_batches.append(features)
             target_batches.append(targets)
             retained += len(targets)
@@ -4398,7 +4467,8 @@ def _learned_hungarian_shared_samples(
 
 def _graph_imitation_shared_samples(
         envelopes: list[dict | Path], objective: str, *,
-        sample_limit: int | None = None):
+        sample_limit: int | None = None, traffic: bool = False):
+    names = TRAFFIC_GRAPH_FEATURE_NAMES if traffic else GRAPH_FEATURE_NAMES
     feature_batches = []
     label_batches = []
     raw_sample_count = 0
@@ -4414,15 +4484,18 @@ def _graph_imitation_shared_samples(
         for rows in _physical_groups([envelope]):
             for row in rows:
                 supervision = _shared_supervision(row)
-                batch = supervision["graph_by_objective"].get(objective)
+                field = "traffic_graph_by_objective" if traffic else "graph_by_objective"
+                batch = supervision.get(field, {}).get(objective)
                 if not isinstance(batch, dict):
                     raise RuntimeError(
                         "GraphImitation objective supervision is missing")
+                if traffic and batch.get("feature_version") != TRAFFIC_GRAPH_FEATURE_VERSION:
+                    raise RuntimeError("GraphImitation traffic supervision version mismatch")
                 features = np.asarray(batch.get("features"), dtype=np.float64)
                 labels = np.asarray(
                     batch.get("labels"), dtype=np.float64).reshape(-1)
                 if (features.shape !=
-                        (len(labels), len(GRAPH_FEATURE_NAMES)) or
+                        (len(labels), len(names)) or
                         not len(labels) or
                         not np.all(np.isfinite(features)) or
                         not np.all(np.isin(labels, (0.0, 1.0)))):
@@ -4442,7 +4515,7 @@ def _graph_imitation_shared_samples(
             quota = max(2, (sample_limit - retained) // envelopes_left)
             features, labels = _bounded_supervised_batches(
                 episode_features, episode_labels, sample_limit=quota,
-                feature_dim=len(GRAPH_FEATURE_NAMES), binary=True)
+                feature_dim=len(names), binary=True)
             feature_batches.append(features)
             label_batches.append(labels)
             retained += len(labels)
@@ -4641,26 +4714,29 @@ def update_physical_model(spec: dict, input_checkpoint: Path,
 
     if name == "LearnedHungarian":
         parameters = training_parameters(spec)
-        if not shared_supervision_envelopes:
+        traffic = bool(spec.get("traffic_version"))
+        names = TRAFFIC_PAIR_FEATURE_NAMES if traffic else PAIR_FEATURE_NAMES
+        if not shared_supervision_envelopes and not traffic:
             raise RuntimeError(
                 "LearnedHungarian requires the shared Webots corpus")
         fit_features, fit_targets, shared_supervision_samples = (
             _learned_hungarian_shared_samples(
                 shared_supervision_envelopes, spec["objective"],
-                sample_limit=200_000))
+                sample_limit=200_000, traffic=traffic)
+            if shared_supervision_envelopes else ([], [], 0))
         own_features, own_targets, _own_raw_count = (
             _learned_hungarian_shared_samples(
                 history_envelopes + current_envelopes, spec["objective"],
-                sample_limit=200_000))
+                sample_limit=200_000, traffic=traffic))
         fit_features.extend(own_features)
         fit_targets.extend(own_targets)
         _current_features, _current_targets, current_count = (
             _learned_hungarian_shared_samples(
                 current_envelopes, spec["objective"],
-                sample_limit=200_000))
+                sample_limit=200_000, traffic=traffic))
         fit_features, fit_targets = _bounded_supervised_batches(
             fit_features, fit_targets, sample_limit=200_000,
-            feature_dim=len(PAIR_FEATURE_NAMES))
+            feature_dim=len(names))
         if current_count < 1:
             raise RuntimeError(
                 "LearnedHungarian Webots fine tune has no physical samples")
@@ -4672,28 +4748,31 @@ def update_physical_model(spec: dict, input_checkpoint: Path,
         samples = current_count
     elif name == "GraphImitation":
         parameters = training_parameters(spec)
-        if not shared_supervision_envelopes:
+        traffic = bool(spec.get("traffic_version"))
+        names = TRAFFIC_GRAPH_FEATURE_NAMES if traffic else GRAPH_FEATURE_NAMES
+        if not shared_supervision_envelopes and not traffic:
             raise RuntimeError(
                 "GraphImitation requires the shared Webots corpus")
         fit_features, fit_labels, shared_supervision_samples = (
             _graph_imitation_shared_samples(
                 shared_supervision_envelopes, spec["objective"],
-                sample_limit=50_000))
+                sample_limit=50_000, traffic=traffic)
+            if shared_supervision_envelopes else ([], [], 0))
         own_features, own_labels, _own_raw_count = (
             _graph_imitation_shared_samples(
                 history_envelopes + current_envelopes, spec["objective"],
-                sample_limit=50_000))
+                sample_limit=50_000, traffic=traffic))
         fit_features.extend(own_features)
         fit_labels.extend(own_labels)
         _current_features, _current_labels, current_count = (
             _graph_imitation_shared_samples(
                 current_envelopes, spec["objective"],
-                sample_limit=50_000))
+                sample_limit=50_000, traffic=traffic))
         if not fit_labels:
             raise RuntimeError("GraphImitation Webots samples are empty")
         fit_features, fit_labels = _bounded_supervised_batches(
             fit_features, fit_labels, sample_limit=50_000,
-            feature_dim=len(GRAPH_FEATURE_NAMES), binary=True)
+            feature_dim=len(names), binary=True)
         model = GraphEdgeImitationModel.fit(
             fit_features, fit_labels,
             epochs=parameters["epochs"],

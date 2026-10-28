@@ -438,8 +438,45 @@ class HeadlessFactoryRuntime:
             current_time=self.current_time,
             congestion_map=self.coordinator.get_congestion_map(),
             failed_pairs=frozenset(self._failed_pairs),
+            traffic_context=self._traffic_snapshot(provider),
             configuration=configuration,
         )
+
+    def _traffic_observations(self):
+        observations = {}
+        for rid, state in self.robots.items():
+            points = self._waypoints[rid]
+            index = self._waypoint_index[rid]
+            remaining = points[index:]
+            not_before = max(self.current_time, self._dispatch_not_before[rid],
+                             float(state.get("_headless_hold_until", 0.0)))
+            if remaining:
+                at_target = math.dist(state["position"], remaining[0]) <= float(
+                    state.get("_headless_waypoint_tolerance",
+                              self.config.direct_waypoint_tolerance))
+                if at_target and index < len(self._waypoint_not_before[rid]):
+                    not_before = max(not_before, self._waypoint_not_before[rid][index])
+                if at_target and len(remaining) == 1 and state.get(
+                        "_headless_joint_plan_partial", False):
+                    not_before = max(not_before, self.current_time + 0.5)
+            observations[rid] = {
+                "position": state["position"], "heading": state.get("heading", 0),
+                "traffic_route": tuple(remaining),
+                "traffic_not_before": not_before,
+                "traffic_speed_scale": state.get("speed_scale", 1.0),
+                "traffic_moving": bool(remaining),
+                "planned_wait": not_before > self.current_time,
+            }
+        return observations
+
+    def _traffic_snapshot(self, provider):
+        if not self._base_context.configuration.get("graph_traffic_enabled", False):
+            return self._base_context.traffic_context
+        if not hasattr(self, "_traffic_builder"):
+            from traffic_features import TrafficSnapshotBuilder
+            self._traffic_builder = TrafficSnapshotBuilder()
+        return self._traffic_builder.snapshot(
+            self.current_time, self._traffic_observations(), provider)
 
     def arrived_pending_tasks(self) -> List[TransportTask]:
         return [
@@ -2822,6 +2859,12 @@ class HeadlessFactoryRuntime:
         self._visible_task_ids.update(arrived)
         for task in self.tasks:
             events.extend(task.deadline_events(self.current_time))
+        if self._base_context.configuration.get("graph_traffic_enabled", False):
+            if not hasattr(self, "_traffic_builder"):
+                from traffic_features import TrafficSnapshotBuilder
+                self._traffic_builder = TrafficSnapshotBuilder()
+            self._traffic_builder.observe(
+                self.current_time, self._traffic_observations())
         if self.current_time + 1e-9 >= self.config.episode_end_time:
             events.extend(self._finalize_horizon())
         return events

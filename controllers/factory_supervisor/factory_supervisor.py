@@ -2756,6 +2756,13 @@ class FactorySupervisor:
             "count_evaluation": count_score,
             "utility_v2_evaluation": utility_score,
         }
+        if getattr(self.scheduler, "graph_expert", False):
+            result["graph_expert"] = self.scheduler.evaluation_metadata()
+        if getattr(self.scheduler, "sarsa_v3", False):
+            result["sarsa_v3"] = self.scheduler.finalize(
+                tasks, float(SIM_DURATION), self.metrics.physical_collision_count,
+                utility_profile=self._utility_reward_profile,
+                output_path=os.environ.get("SMART_FACTORY_SARSA_V3_OUTPUT_MODEL") or None)
         if self._physical_fine_tune_enabled:
             objective = os.environ.get(
                 "SMART_FACTORY_FINE_TUNE_OBJECTIVE", "").strip()
@@ -5749,6 +5756,10 @@ class FactorySupervisor:
             # Simulate robot movement toward waypoints (if not using physics)
             self._simulate_movement(rid, dt)
 
+        if getattr(getattr(self, "scheduler", None), "uses_traffic", False):
+            self._get_traffic_builder().observe(
+                self.sim_time, self._traffic_observations())
+
     def _simulate_movement(self, robot_id: int, dt: float):
         """
         Track waypoint progression using the robot's REAL position
@@ -6354,11 +6365,39 @@ class FactorySupervisor:
             oracle.bind_robot_states(robot_states)
         return oracle
 
+    def _get_traffic_builder(self):
+        if not hasattr(self, "_traffic_builder"):
+            from traffic_features import TrafficSnapshotBuilder
+            self._traffic_builder = TrafficSnapshotBuilder()
+        return self._traffic_builder
+
+    def _traffic_observations(self):
+        result = {}
+        for rid, robot in self.robots.items():
+            remaining = robot.waypoints[robot.current_waypoint_idx:]
+            not_before = max(
+                self.sim_time, robot.dispatch_not_before, robot.hold_until,
+                robot.controller_paused_until, robot.controller_joint_wait_until)
+            result[rid] = {
+                "position": robot.position, "heading": robot.heading,
+                "traffic_route": tuple(remaining),
+                "traffic_not_before": not_before,
+                "traffic_speed_scale": robot.speed_scale,
+                "traffic_moving": bool(remaining),
+                "planned_wait": not_before > self.sim_time,
+            }
+        return result
+
     def _assign_tasks_impl(self):
         """Run the scheduler to assign pending tasks to idle robots."""
         if not getattr(self, "system_ready", True) or getattr(
                 self, "startup_failed", False):
             return
+        if getattr(self.scheduler, "sarsa_v3", False):
+            self.scheduler.observe(
+                self.task_generator.tasks_generated, self.sim_time,
+                self.metrics.physical_collision_count,
+                utility_profile=self._utility_reward_profile)
         pending = self.task_generator.get_pending_tasks()
         if not pending:
             return
@@ -6417,8 +6456,16 @@ class FactorySupervisor:
                 },
             )
             try:
+                if getattr(self.scheduler, "uses_traffic", False):
+                    from dataclasses import replace
+                    context = replace(context, traffic_context=(
+                        self._get_traffic_builder().snapshot(
+                            self.sim_time, self._traffic_observations(),
+                            context.path_cost_provider)))
                 decision = self.scheduler.assign(pending, robot_states, context)
             except Exception as exc:
+                if getattr(self.scheduler, "pure_policy_required", False):
+                    raise RuntimeError(f"pure {self.scheduler.name} scheduling failed") from exc
                 decision = SchedulerResult(
                     algorithm_name=getattr(self.scheduler, "name", "unknown"),
                     diagnostics={"reason": "scheduler_exception",
@@ -6439,6 +6486,11 @@ class FactorySupervisor:
                         decision.diagnostics.get("reason", "unspecified")))
             if not decision.is_feasible or not decision.assignments:
                 reason = decision.diagnostics.get("reason", "")
+                if getattr(self.scheduler, "pure_policy_required", False):
+                    if decision.is_feasible and decision.diagnostics.get("intentional_wait"):
+                        self.metrics.record_scheduling_latency(scheduling_seconds)
+                        break
+                    raise RuntimeError(f"pure {self.scheduler.name} returned an invalid decision: {reason}")
                 if self._physical_fine_tune_enabled:
                     if is_scheduler_wait_reason(reason):
                         # GraphPPO's physical action space has no no-op edge.

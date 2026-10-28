@@ -5,8 +5,9 @@ numpy>=1.21.0
 matplotlib>=3.5.0
 scipy>=1.7.0
 
-# Optional: For full PPO training with GPU support
-# torch>=1.12.0
+# Neural SARSA/PPO GPU support is pinned separately because the CUDA wheel
+# index is platform-specific. Install requirements-torch-cu126.txt on the
+# registered Windows/Webots training host.
 # gymnasium>=0.26.0
 
 # Optional: For advanced visualization

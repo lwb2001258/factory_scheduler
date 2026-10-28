@@ -83,3 +83,60 @@ Reviewed source SHA-256:
 24183DEC831AB49CF6FD83DF573A8D9267BF89835DB3B9CB6372F1EA263D5F77  controllers/factory_supervisor/schedulers.py
 904676A605FCF9313E7EFB4C17124619BCF74F280B0B25C8F37812B20A41A4D9  controllers/factory_supervisor/factory_supervisor.py
 ```
+
+## Step 5 — resumable training and evaluation workflow
+
+Initial Review B required changes: standalone initialization was merely
+loadable rather than compared with the registered deterministic initial state,
+and fine-tune initialization was not bound to its standalone parent hash.  Both
+identity checks were added and the three reviews restarted.
+
+- Review A (algorithm/partitions): passed.  Count and Utility V2 remain
+  independent cumulative policies; standalone uses 21000--21059, Webots
+  fine-tune uses 41000--41009, and frozen evaluation uses 61000--61005.  There
+  is no validation/non-regression comparison, rollback, or evaluation-based
+  selection.
+- Review B (resume/safety): passed.  Source/configuration, manifest, input
+  checkpoint, and initial-parent hashes are pinned.  Canonical records are
+  written only after complete episodes; partial attempts remain isolated; a
+  changed source or checkpoint blocks stale resume; every next phase requires
+  three reviews of the previous phase evidence.
+- Review C (execution/final diff): passed.  Review-gate tests and 16 existing
+  workflow-protection tests passed.  A real CUDA-backed scenario A/seed 21000
+  1800-second standalone episode completed 51 tasks, produced neural updates,
+  wrote a loadable checkpoint, and took 15.1 wall
+  seconds.  AST compilation, CLI help, and `git diff --check` passed.
+
+Reviewed source SHA-256:
+
+```text
+7F8FC010E210AAE6C9EB636949D853DC3DA08C626EAE980C8463F698FB7EF80E  scripts/neural_sarsa_workflow_contract.py
+C09F3CEDC818BAF609F74130F6BD2F537C140517A5251ABB869AF3C104C900E9  scripts/run_sarsa_v4_workflow.py
+```
+
+## Step 6 — tests and dependency contract
+
+- Review A (focused behavior): passed.  Six neural v4 tests cover exact shared
+  GraphImitation conflict penalties, 385+72 feature partitioning, illegal-action
+  masks, exact epsilon-greedy expectation, terminal n-step flushing, checkpoint
+  boundaries, commit/rejection attribution, frozen evaluation, versioned
+  factory opt-in, and three-review hash binding.  CUDA backward passed.
+- Review B (project regression): passed.  The full suite completed 461 tests in
+  118.237 seconds with no failure.  Existing v3, GraphImitation,
+  LearnedHungarian, runtime, workflow, reward, purity, and Webots launcher tests
+  remain green.
+- Review C (final diff/dependencies): passed.  All changed Python sources
+  compiled from text, final `git diff --check` passed, and the installed
+  `torch==2.14.1+cu126` matched the new CUDA-specific requirement.  `pip check`
+  still reports the pre-existing `opencv-python 4.12.0.88` versus NumPy 2.4.3
+  constraint; neither neural SARSA nor the project core imports OpenCV, so this
+  review records it without changing NumPy before the formal run.
+
+Reviewed source SHA-256:
+
+```text
+6E4FF199336E8D102914F4DB3343FA91A8089E54AD5C931ECD284F4B52F99C6C  requirements.txt
+E18180822DACB558C2853CE77B11BD6C2E2955036806876C6DC1F363482C563A  requirements-torch-cu126.txt
+8CD71B2496565364093D099E6D609CC945C12DFD0178ACAD5B0D1D18B39CF872  docs/ml_scheduler_1800_evaluation.md
+AFA862E21CA144BF25D1E7DB09C299224D2F332B5F5655778CCF7727EC842D73  tests/test_sarsa_v4_neural.py
+```

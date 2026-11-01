@@ -66,6 +66,11 @@ from dual_objective import (  # noqa: E402
     CountRewardProfile, UtilityScoreConfig, UtilityV2RewardProfile,
     physical_episode_reward_attribution,
 )
+from expert_coefficients import (  # noqa: E402
+    CONFIGURATION_KEY as EXPERT_COEFFICIENT_CONFIGURATION_KEY,
+    bundle_sha256 as expert_bundle_sha256,
+    canonical_bundle as canonical_expert_bundle,
+)
 from graph_ppo_scheduler import (  # noqa: E402
     GraphPPOConfig, GraphPPOModel, GraphRolloutStep,
 )
@@ -397,6 +402,9 @@ def training_config_sha256(spec: dict) -> str:
     }
     if spec.get("traffic_version"):
         payload["traffic_version"] = spec["traffic_version"]
+    if spec.get("expert_coefficient_bundle") is not None:
+        payload["expert_coefficient_sha256"] = expert_bundle_sha256(
+            spec["expert_coefficient_bundle"])
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"),
         ensure_ascii=True, allow_nan=False).encode("utf-8")).hexdigest()
@@ -791,11 +799,25 @@ def load_model(spec: dict, path: Path, seed: int, *,
             raise ModelValidationError("Ridge traffic training contract mismatch")
         if model.uses_traffic and model.target_name != f"{spec['objective']}_expert_cost":
             raise ModelValidationError("Ridge objective target mismatch")
+        expected_bundle = spec.get("expert_coefficient_bundle")
+        actual_bundle = model.expert_coefficient_bundle
+        if ((expected_bundle is None) != (actual_bundle is None) or
+                (expected_bundle is not None and
+                 expert_bundle_sha256(actual_bundle) !=
+                 expert_bundle_sha256(expected_bundle))):
+            raise ModelValidationError("Ridge expert coefficient identity mismatch")
         return model
     if name == "GraphImitation":
         model = GraphEdgeImitationModel.load(path)
         if model.uses_traffic != bool(spec.get("traffic_version")):
             raise ModelValidationError("graph traffic training contract mismatch")
+        expected_bundle = spec.get("expert_coefficient_bundle")
+        actual_bundle = model.expert_coefficient_bundle
+        if ((expected_bundle is None) != (actual_bundle is None) or
+                (expected_bundle is not None and
+                 expert_bundle_sha256(actual_bundle) !=
+                 expert_bundle_sha256(expected_bundle))):
+            raise ModelValidationError("graph expert coefficient identity mismatch")
         return model
     if name == "GraphPPO":
         return GraphPPOModel.load(path, seed=seed)
@@ -1907,6 +1929,9 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
     """
     name = spec["scheduler"]
     uses_traffic = bool(spec.get("traffic_version"))
+    expert_bundle = spec.get("expert_coefficient_bundle")
+    if expert_bundle is not None:
+        expert_bundle = canonical_expert_bundle(expert_bundle)
     if Path(input_checkpoint).resolve() == Path(spec["source"]).resolve():
         # Supervised policies bootstrap only from labels collected in this new
         # run; no prior candidate parameters or samples are loaded.
@@ -1919,7 +1944,9 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
         _episode_environment(manifest, scenario, seed, spec["objective"]))
     if uses_traffic:
         context = replace(context, configuration={
-            **context.configuration, "graph_traffic_enabled": True})
+            **context.configuration, "graph_traffic_enabled": True,
+            **({EXPERT_COEFFICIENT_CONFIGURATION_KEY: expert_bundle}
+               if expert_bundle is not None else {})})
     _state, metadata = environment.reset(robots, tasks, context, seed=seed)
     if metadata["reward_profile_hash"] != profile.sha256:
         raise RuntimeError("supervised training reward profile mismatch")
@@ -2036,13 +2063,15 @@ def _train_supervised_policy(spec: dict, input_checkpoint: Path,
         if name == "LearnedHungarian":
             model = RidgeCostModel.fit(
                 fit_features, fit_targets, l2=parameters["l2"],
-                target_name=target_name)
+                target_name=target_name,
+                expert_coefficient_bundle=expert_bundle)
         else:
             model = GraphEdgeImitationModel.fit(
                 fit_features, fit_targets,
                 epochs=parameters["epochs"],
                 learning_rate=parameters["learning_rate"],
-                l2=parameters["l2"])
+                l2=parameters["l2"],
+                expert_coefficient_bundle=expert_bundle)
     return model, {"kind": kind, "features": features,
                    "targets": targets}, {
         "episode_return": episode_return,
@@ -4406,7 +4435,8 @@ def _load_supervision_envelope(value) -> dict:
 
 def _learned_hungarian_shared_samples(
         envelopes: list[dict | Path], objective: str, *,
-        sample_limit: int | None = None, traffic: bool = False):
+        sample_limit: int | None = None, traffic: bool = False,
+        expert_coefficient_bundle=None):
     names = TRAFFIC_PAIR_FEATURE_NAMES if traffic else PAIR_FEATURE_NAMES
     feature_batches = []
     target_batches = []
@@ -4432,6 +4462,14 @@ def _learned_hungarian_shared_samples(
             if traffic and (batch.get("feature_version") != TRAFFIC_PAIR_FEATURE_VERSION or
                             batch.get("traffic_version") != TRAFFIC_VERSION):
                 raise RuntimeError("LearnedHungarian traffic supervision version mismatch")
+            if expert_coefficient_bundle is not None and (
+                    batch.get("expert_coefficient_sha256") !=
+                    expert_bundle_sha256(expert_coefficient_bundle) or
+                    expert_bundle_sha256(
+                        batch.get("expert_coefficient_bundle")) !=
+                    expert_bundle_sha256(expert_coefficient_bundle)):
+                raise RuntimeError(
+                    "LearnedHungarian expert coefficient identity mismatch")
             features = np.asarray(batch.get("features"), dtype=np.float64)
             targets = np.asarray(
                 batch.get("targets"), dtype=np.float64).reshape(-1)
@@ -4467,7 +4505,8 @@ def _learned_hungarian_shared_samples(
 
 def _graph_imitation_shared_samples(
         envelopes: list[dict | Path], objective: str, *,
-        sample_limit: int | None = None, traffic: bool = False):
+        sample_limit: int | None = None, traffic: bool = False,
+        expert_coefficient_bundle=None):
     names = TRAFFIC_GRAPH_FEATURE_NAMES if traffic else GRAPH_FEATURE_NAMES
     feature_batches = []
     label_batches = []
@@ -4491,6 +4530,14 @@ def _graph_imitation_shared_samples(
                         "GraphImitation objective supervision is missing")
                 if traffic and batch.get("feature_version") != TRAFFIC_GRAPH_FEATURE_VERSION:
                     raise RuntimeError("GraphImitation traffic supervision version mismatch")
+                if expert_coefficient_bundle is not None and (
+                        batch.get("expert_coefficient_sha256") !=
+                        expert_bundle_sha256(expert_coefficient_bundle) or
+                        expert_bundle_sha256(
+                            batch.get("expert_coefficient_bundle")) !=
+                        expert_bundle_sha256(expert_coefficient_bundle)):
+                    raise RuntimeError(
+                        "GraphImitation expert coefficient identity mismatch")
                 features = np.asarray(batch.get("features"), dtype=np.float64)
                 labels = np.asarray(
                     batch.get("labels"), dtype=np.float64).reshape(-1)
@@ -4715,6 +4762,7 @@ def update_physical_model(spec: dict, input_checkpoint: Path,
     if name == "LearnedHungarian":
         parameters = training_parameters(spec)
         traffic = bool(spec.get("traffic_version"))
+        expert_bundle = spec.get("expert_coefficient_bundle")
         names = TRAFFIC_PAIR_FEATURE_NAMES if traffic else PAIR_FEATURE_NAMES
         if not shared_supervision_envelopes and not traffic:
             raise RuntimeError(
@@ -4722,18 +4770,21 @@ def update_physical_model(spec: dict, input_checkpoint: Path,
         fit_features, fit_targets, shared_supervision_samples = (
             _learned_hungarian_shared_samples(
                 shared_supervision_envelopes, spec["objective"],
-                sample_limit=200_000, traffic=traffic)
+                sample_limit=200_000, traffic=traffic,
+                expert_coefficient_bundle=expert_bundle)
             if shared_supervision_envelopes else ([], [], 0))
         own_features, own_targets, _own_raw_count = (
             _learned_hungarian_shared_samples(
                 history_envelopes + current_envelopes, spec["objective"],
-                sample_limit=200_000, traffic=traffic))
+                sample_limit=200_000, traffic=traffic,
+                expert_coefficient_bundle=expert_bundle))
         fit_features.extend(own_features)
         fit_targets.extend(own_targets)
         _current_features, _current_targets, current_count = (
             _learned_hungarian_shared_samples(
                 current_envelopes, spec["objective"],
-                sample_limit=200_000, traffic=traffic))
+                sample_limit=200_000, traffic=traffic,
+                expert_coefficient_bundle=expert_bundle))
         fit_features, fit_targets = _bounded_supervised_batches(
             fit_features, fit_targets, sample_limit=200_000,
             feature_dim=len(names))
@@ -4743,12 +4794,14 @@ def update_physical_model(spec: dict, input_checkpoint: Path,
         model = RidgeCostModel.fit(
             fit_features, fit_targets,
             l2=parameters["l2"],
-            target_name=f"{spec['objective']}_expert_cost")
+            target_name=f"{spec['objective']}_expert_cost",
+            expert_coefficient_bundle=expert_bundle)
         updates = 1
         samples = current_count
     elif name == "GraphImitation":
         parameters = training_parameters(spec)
         traffic = bool(spec.get("traffic_version"))
+        expert_bundle = spec.get("expert_coefficient_bundle")
         names = TRAFFIC_GRAPH_FEATURE_NAMES if traffic else GRAPH_FEATURE_NAMES
         if not shared_supervision_envelopes and not traffic:
             raise RuntimeError(
@@ -4756,18 +4809,21 @@ def update_physical_model(spec: dict, input_checkpoint: Path,
         fit_features, fit_labels, shared_supervision_samples = (
             _graph_imitation_shared_samples(
                 shared_supervision_envelopes, spec["objective"],
-                sample_limit=50_000, traffic=traffic)
+                sample_limit=50_000, traffic=traffic,
+                expert_coefficient_bundle=expert_bundle)
             if shared_supervision_envelopes else ([], [], 0))
         own_features, own_labels, _own_raw_count = (
             _graph_imitation_shared_samples(
                 history_envelopes + current_envelopes, spec["objective"],
-                sample_limit=50_000, traffic=traffic))
+                sample_limit=50_000, traffic=traffic,
+                expert_coefficient_bundle=expert_bundle))
         fit_features.extend(own_features)
         fit_labels.extend(own_labels)
         _current_features, _current_labels, current_count = (
             _graph_imitation_shared_samples(
                 current_envelopes, spec["objective"],
-                sample_limit=50_000, traffic=traffic))
+                sample_limit=50_000, traffic=traffic,
+                expert_coefficient_bundle=expert_bundle))
         if not fit_labels:
             raise RuntimeError("GraphImitation Webots samples are empty")
         fit_features, fit_labels = _bounded_supervised_batches(
@@ -4777,7 +4833,8 @@ def update_physical_model(spec: dict, input_checkpoint: Path,
             fit_features, fit_labels,
             epochs=parameters["epochs"],
             learning_rate=parameters["learning_rate"] * 0.1,
-            l2=parameters["l2"])
+            l2=parameters["l2"],
+            expert_coefficient_bundle=expert_bundle)
         updates = 1
         samples = current_count
     elif name == "GraphPPO":

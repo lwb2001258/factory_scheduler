@@ -6581,7 +6581,10 @@ class FactorySupervisor:
                     # pre-commit snapshot seen by the scheduler.  It does not
                     # alter the chosen pair, route or robot command.
                     shared_supervision = physical_supervision_snapshot(
-                        assignment, robot_states, pending, context)
+                        assignment, robot_states, pending, context,
+                        expert_coefficient_bundle=getattr(
+                            active_scheduler,
+                            "expert_coefficient_bundle", None))
                 # Commit task and robot state only after a usable plan exists.
                 task.status = (TaskStatus.IN_PROGRESS
                                if pickup_already_reached else

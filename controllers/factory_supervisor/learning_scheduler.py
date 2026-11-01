@@ -10,7 +10,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -18,6 +18,14 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from config import RL_ENVIRONMENT_VERSION, RobotState, TaskStatus
+from expert_coefficients import (
+    CONFIGURATION_KEY as EXPERT_COEFFICIENT_CONFIGURATION_KEY,
+    bundle_sha256 as expert_bundle_sha256,
+    canonical_bundle as canonical_expert_bundle,
+    coefficients_for as expert_coefficients_for,
+    configured_bundle as configured_expert_bundle,
+    traffic_penalty as learned_traffic_penalty,
+)
 from schedulers import (
     Assignment,
     BaseScheduler,
@@ -361,10 +369,21 @@ def traffic_pair_feature_tensor(matrix, pair_features, context):
     return result
 
 
-def traffic_objective_expert_values(matrix, context, objective):
+def traffic_objective_expert_values(matrix, context, objective,
+                                    coefficient_bundle=None):
     """Preserve Count/Utility objectives, adding route-specific delay costs."""
-    values = objective_expert_values(matrix, context, objective)
-    _features, penalties = traffic_edge_values(matrix, context)
+    bundle = (canonical_expert_bundle(coefficient_bundle)
+              if coefficient_bundle is not None else
+              configured_expert_bundle(context.configuration))
+    values = objective_expert_values(
+        matrix, context, objective, coefficient_bundle=bundle)
+    features, penalties = traffic_edge_values(matrix, context)
+    if bundle is not None:
+        coefficients = expert_coefficients_for(bundle, objective)
+        for row, column in np.argwhere(matrix.feasible):
+            penalties[row, column] = learned_traffic_penalty(
+                dict(zip(TRAFFIC_FEATURE_NAMES, features[row, column])),
+                coefficients)
     values[matrix.feasible] += penalties[matrix.feasible]
     return values
 
@@ -375,9 +394,14 @@ def traffic_ridge_supervision(matrix, features, context, objective):
     if features.shape != expected or not np.all(np.isfinite(features)):
         raise ValueError("traffic Ridge supervision feature contract mismatch")
     values = traffic_objective_expert_values(matrix, context, objective)
+    bundle = configured_expert_bundle(context.configuration)
     return {
         "feature_version": TRAFFIC_PAIR_FEATURE_VERSION,
         "traffic_version": TRAFFIC_VERSION,
+        **({
+            "expert_coefficient_bundle": bundle,
+            "expert_coefficient_sha256": expert_bundle_sha256(bundle),
+        } if bundle is not None else {}),
         "features": features[matrix.feasible].tolist(),
         "targets": values[matrix.feasible].tolist(),
         "sample_count": int(np.count_nonzero(matrix.feasible)),
@@ -399,9 +423,14 @@ def traffic_graph_supervision(matrix, graph_features, context, objective,
         negatives.remove(behavior_coordinate)
         negatives.insert(0, behavior_coordinate)
     coordinates = positives + negatives[:max(4, 3 * len(positives))]
+    bundle = configured_expert_bundle(context.configuration)
     return {
         "feature_version": TRAFFIC_GRAPH_FEATURE_VERSION,
         "traffic_version": TRAFFIC_VERSION,
+        **({
+            "expert_coefficient_bundle": bundle,
+            "expert_coefficient_sha256": expert_bundle_sha256(bundle),
+        } if bundle is not None else {}),
         "features": [graph_features[value].tolist() for value in coordinates],
         "labels": [float(value in positive_set) for value in coordinates],
         "positive_count": len(positives),
@@ -478,6 +507,7 @@ class RidgeCostModel:
     intercept: float
     training_samples: int
     target_name: str = "execution_time"
+    expert_coefficient_bundle: Optional[dict] = None
 
     @property
     def uses_traffic(self):
@@ -497,7 +527,8 @@ class RidgeCostModel:
 
     @classmethod
     def fit(cls, features, targets, *, l2: float = 1.0,
-            target_name: str = "execution_time"):
+            target_name: str = "execution_time",
+            expert_coefficient_bundle=None):
         supplied = np.asarray(features)
         if supplied.ndim != 2 or supplied.shape[1] not in (
                 len(PAIR_FEATURE_NAMES), len(TRAFFIC_PAIR_FEATURE_NAMES)):
@@ -532,8 +563,14 @@ class RidgeCostModel:
                 design.T @ y, rcond=None)[0]
         if not np.all(np.isfinite(parameters)):
             raise ValueError("ridge fitting produced invalid parameters")
+        bundle = (canonical_expert_bundle(expert_coefficient_bundle)
+                  if expert_coefficient_bundle is not None else None)
+        if (bundle is not None and
+                supplied.shape[1] != len(TRAFFIC_PAIR_FEATURE_NAMES)):
+            raise ValueError(
+                "expert coefficient provenance requires traffic Ridge features")
         return cls(mean, scale, parameters[1:], float(parameters[0]),
-                   int(x.shape[0]), target_name)
+                   int(x.shape[0]), target_name, bundle)
 
     def predict(self, features) -> np.ndarray:
         x = np.asarray(features, dtype=np.float64)
@@ -562,6 +599,11 @@ class RidgeCostModel:
         }
         if self.uses_traffic:
             metadata["traffic_version"] = TRAFFIC_VERSION
+        if self.expert_coefficient_bundle is not None:
+            metadata["expert_coefficient_bundle"] = canonical_expert_bundle(
+                self.expert_coefficient_bundle)
+            metadata["expert_coefficient_sha256"] = expert_bundle_sha256(
+                self.expert_coefficient_bundle)
         _atomic_save_npz(
             path, metadata=_metadata_array(metadata), mean=self.mean,
             scale=self.scale, coefficients=self.coefficients,
@@ -605,8 +647,26 @@ class RidgeCostModel:
             raise ModelValidationError("unsupported learned-cost target")
         if traffic and target_name not in {"count_expert_cost", "utility_v2_expert_cost"}:
             raise ModelValidationError("traffic Ridge requires objective expert cost targets")
+        bundle = metadata.get("expert_coefficient_bundle")
+        bundle_hash = metadata.get("expert_coefficient_sha256")
+        if (bundle is None) != (bundle_hash is None):
+            raise ModelValidationError(
+                "learned-cost expert coefficient identity is incomplete")
+        if bundle is not None and not traffic:
+            raise ModelValidationError(
+                "legacy learned-cost model cannot carry traffic coefficients")
+        if bundle is not None:
+            try:
+                bundle = canonical_expert_bundle(bundle)
+            except ValueError as exc:
+                raise ModelValidationError(
+                    "learned-cost expert coefficient bundle is invalid") from exc
+            if bundle_hash != expert_bundle_sha256(bundle):
+                raise ModelValidationError(
+                    "learned-cost expert coefficient identity changed")
         return cls(mean, scale, coefficients, intercept,
-                   int(metadata.get("training_samples", 0)), target_name)
+                   int(metadata.get("training_samples", 0)), target_name,
+                   bundle)
 
 
 @dataclass(frozen=True)
@@ -616,6 +676,7 @@ class GraphEdgeImitationModel:
     weights: np.ndarray
     intercept: float
     training_samples: int
+    expert_coefficient_bundle: Optional[dict] = None
 
     @property
     def uses_traffic(self):
@@ -631,7 +692,8 @@ class GraphEdgeImitationModel:
 
     @classmethod
     def fit(cls, features, labels, *, epochs: int = 500,
-            learning_rate: float = 0.05, l2: float = 1e-4):
+            learning_rate: float = 0.05, l2: float = 1e-4,
+            expert_coefficient_bundle=None):
         supplied = np.asarray(features)
         if supplied.ndim != 2 or supplied.shape[1] not in (
                 len(GRAPH_FEATURE_NAMES), len(TRAFFIC_GRAPH_FEATURE_NAMES)):
@@ -663,7 +725,13 @@ class GraphEdgeImitationModel:
             intercept -= rate * float(np.sum(error) / np.sum(sample_weights))
         if not np.all(np.isfinite(weights)) or not math.isfinite(intercept):
             raise ValueError("graph imitation fitting produced invalid parameters")
-        return cls(mean, scale, weights, intercept, int(x.shape[0]))
+        bundle = (canonical_expert_bundle(expert_coefficient_bundle)
+                  if expert_coefficient_bundle is not None else None)
+        if (bundle is not None and
+                supplied.shape[1] != len(TRAFFIC_GRAPH_FEATURE_NAMES)):
+            raise ValueError(
+                "expert coefficient provenance requires traffic graph features")
+        return cls(mean, scale, weights, intercept, int(x.shape[0]), bundle)
 
     def predict_proba(self, features) -> np.ndarray:
         x = np.asarray(features, dtype=np.float64)
@@ -691,6 +759,11 @@ class GraphEdgeImitationModel:
             "feature_names": list(self.feature_names),
             "training_samples": int(self.training_samples),
         }
+        if self.expert_coefficient_bundle is not None:
+            metadata["expert_coefficient_bundle"] = canonical_expert_bundle(
+                self.expert_coefficient_bundle)
+            metadata["expert_coefficient_sha256"] = expert_bundle_sha256(
+                self.expert_coefficient_bundle)
         _atomic_save_npz(
             path, metadata=_metadata_array(metadata), mean=self.mean,
             scale=self.scale, weights=self.weights,
@@ -726,8 +799,25 @@ class GraphEdgeImitationModel:
                 not np.all(np.isfinite(weights)) or
                 not math.isfinite(intercept)):
             raise ModelValidationError("graph model parameters are invalid")
+        bundle = metadata.get("expert_coefficient_bundle")
+        bundle_hash = metadata.get("expert_coefficient_sha256")
+        if (bundle is None) != (bundle_hash is None):
+            raise ModelValidationError(
+                "graph expert coefficient identity is incomplete")
+        if bundle is not None and not traffic:
+            raise ModelValidationError(
+                "legacy graph model cannot carry traffic coefficients")
+        if bundle is not None:
+            try:
+                bundle = canonical_expert_bundle(bundle)
+            except ValueError as exc:
+                raise ModelValidationError(
+                    "graph expert coefficient bundle is invalid") from exc
+            if bundle_hash != expert_bundle_sha256(bundle):
+                raise ModelValidationError(
+                    "graph expert coefficient identity changed")
         return cls(mean, scale, weights, intercept,
-                   int(metadata.get("training_samples", 0)))
+                   int(metadata.get("training_samples", 0)), bundle)
 
 
 def solve_hungarian(values: np.ndarray,
@@ -756,7 +846,8 @@ def solve_hungarian(values: np.ndarray,
 
 def objective_expert_values(matrix: CostMatrix,
                             context: SchedulingContext,
-                            objective: str) -> np.ndarray:
+                            objective: str, coefficient_bundle=None
+                            ) -> np.ndarray:
     """Return a deterministic objective-specific imitation expert matrix.
 
     Count removes the priority/waiting bonuses from the shared operational
@@ -771,10 +862,23 @@ def objective_expert_values(matrix: CostMatrix,
     if values.shape != matrix.feasible.shape:
         raise ValueError("expert matrix shape differs from feasibility mask")
     weights = {
+        "travel": 1.0,
         "priority": 1.0,
         "waiting": 0.01,
+        "congestion": 0.05,
     }
     weights.update(context.configuration.get("cost_weights", {}))
+    bundle = (canonical_expert_bundle(coefficient_bundle)
+              if coefficient_bundle is not None else
+              configured_expert_bundle(context.configuration))
+    coefficients = (expert_coefficients_for(bundle, objective)
+                    if bundle is not None else None)
+    if coefficients is not None:
+        if any(not math.isfinite(float(weights[name]))
+               for name in ("travel", "priority", "waiting", "congestion")):
+            raise ValueError("operational expert cost weights must be finite")
+        if float(weights["travel"]) <= 0.0:
+            raise ValueError("operational travel weight must be positive")
     now = max(0.0, _finite_number(context.current_time))
     unfloored = matrix.unfloored_values
     if unfloored is None:
@@ -793,6 +897,28 @@ def objective_expert_values(matrix: CostMatrix,
             float(weights["priority"]) *
             max(0.0, float(task.priority) - 1.0))
         waiting_bonus = float(weights["waiting"]) * waiting
+        if coefficients is not None:
+            pickup_congestion = _congestion_at(task.pickup_position, context)
+            delivery_congestion = _congestion_at(task.delivery_position, context)
+            congestion = (pickup_congestion + delivery_congestion) / 2.0
+            priority = max(0.0, float(task.priority) - 1.0)
+            # Recover the operational travel term before applying the learned
+            # coefficient row. This keeps travel=1 as a real scale anchor even
+            # if runtime cost_weights supplied another operational multiplier.
+            travel = (
+                unfloored[:, column] +
+                float(weights["priority"]) * priority +
+                float(weights["waiting"]) * waiting -
+                float(weights["congestion"]) * congestion
+            ) / float(weights["travel"])
+            values[:, column] = (
+                coefficients.travel * travel -
+                coefficients.priority_bonus * priority -
+                coefficients.waiting_bonus * waiting +
+                coefficients.congestion_penalty * congestion -
+                coefficients.deadline_pressure_bonus *
+                _weighted_deadline_pressure(task, now))
+            continue
         if objective == "count":
             # Undo priority/waiting terms on the pre-floor value.  Doing this
             # from matrix.values would make a long-waiting task artificially
@@ -930,7 +1056,7 @@ def graph_imitation_values(model: "GraphEdgeImitationModel",
 def physical_supervision_snapshot(
         assignment: Assignment, robot_states: Dict[int, dict],
         pending_tasks: Sequence[TransportTask],
-        context: SchedulingContext) -> dict:
+        context: SchedulingContext, *, expert_coefficient_bundle=None) -> dict:
     """Capture objective-isolated supervision from one physical decision.
 
     The snapshot is telemetry only: it is computed after a route was found but
@@ -939,6 +1065,12 @@ def physical_supervision_snapshot(
     its own deterministic expert, so behavior generated by another scheduler
     is useful state coverage without being mistaken for an expert action.
     """
+    if expert_coefficient_bundle is not None:
+        context = replace(context, configuration={
+            **context.configuration,
+            EXPERT_COEFFICIENT_CONFIGURATION_KEY:
+                canonical_expert_bundle(expert_coefficient_bundle),
+        })
     matrix = build_cost_matrix(list(pending_tasks), robot_states, context)
     pair_features = pair_feature_tensor(
         matrix, robot_states, pending_tasks, context)
@@ -1004,6 +1136,10 @@ class LearnedCostHungarianScheduler(_LearnedMatchingScheduler):
     def uses_traffic(self):
         return self.model.uses_traffic
 
+    @property
+    def expert_coefficient_bundle(self):
+        return self.model.expert_coefficient_bundle
+
     def assign(self, pending_tasks, robot_states,
                context: Optional[SchedulingContext] = None) -> SchedulerResult:
         context = context or SchedulingContext()
@@ -1068,6 +1204,10 @@ class GraphImitationScheduler(_LearnedMatchingScheduler):
     @property
     def uses_traffic(self):
         return self.model.uses_traffic
+
+    @property
+    def expert_coefficient_bundle(self):
+        return self.model.expert_coefficient_bundle
 
     def assign(self, pending_tasks, robot_states,
                context: Optional[SchedulingContext] = None) -> SchedulerResult:

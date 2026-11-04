@@ -162,13 +162,40 @@ def search_fields(objective: str) -> tuple[str, ...]:
 
 
 def row_from_log_multipliers(objective: str, multipliers) -> dict:
+    return row_from_baseline_log_multipliers(
+        objective, default_coefficients(objective).to_dict(), multipliers)
+
+
+def row_from_baseline_log_multipliers(
+        objective: str, baseline: Mapping, multipliers, *,
+        minimum_multiplier: float = 0.1,
+        maximum_multiplier: float = 10.0) -> dict:
+    """Apply bounded log multipliers to a validated warm-start row.
+
+    The fixed travel anchor and objective-isolation rules are revalidated after
+    the update.  Zero warm-start fields stay zero, so callers cannot enable a
+    coefficient that the objective deliberately excludes.
+    """
     fields = search_fields(objective)
     values = tuple(float(value) for value in multipliers)
     if len(values) != len(fields) or not all(math.isfinite(value) for value in values):
         raise ValueError("coefficient search vector is invalid")
-    baseline = default_coefficients(objective).to_dict()
+    if (isinstance(minimum_multiplier, bool) or
+            isinstance(maximum_multiplier, bool) or
+            not isinstance(minimum_multiplier, (int, float)) or
+            not isinstance(maximum_multiplier, (int, float)) or
+            not math.isfinite(float(minimum_multiplier)) or
+            not math.isfinite(float(maximum_multiplier)) or
+            float(minimum_multiplier) <= 0.0 or
+            float(minimum_multiplier) >= float(maximum_multiplier)):
+        raise ValueError("coefficient multiplier bounds are invalid")
+    baseline = ExpertCostCoefficients.from_dict(baseline).to_dict()
+    if baseline["objective"] != objective:
+        raise ValueError("coefficient baseline objective differs")
+    lower = math.log(float(minimum_multiplier))
+    upper = math.log(float(maximum_multiplier))
     for name, log_multiplier in zip(fields, values):
-        clipped = min(math.log(10.0), max(math.log(0.1), log_multiplier))
+        clipped = min(upper, max(lower, log_multiplier))
         baseline[name] = float(baseline[name]) * math.exp(clipped)
     return ExpertCostCoefficients.from_dict(baseline).to_dict()
 

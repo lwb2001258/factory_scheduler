@@ -82,7 +82,9 @@ class SeparableCMAES:
 
     @classmethod
     def create(cls, dimensions: int, *, seed: int,
-               initial_mean=None, initial_sigma: float = 0.55):
+               initial_mean=None, initial_sigma: float = 0.55,
+               lower_bound: float = -math.log(10.0),
+               upper_bound: float = math.log(10.0)):
         default_population_size(dimensions)
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("optimizer seed must be a non-negative integer")
@@ -95,7 +97,8 @@ class SeparableCMAES:
             seed=seed, generation=0, mean=mean,
             sigma=float(initial_sigma), covariance=np.ones(dimensions),
             evolution_path_sigma=np.zeros(dimensions),
-            evolution_path_covariance=np.zeros(dimensions))
+            evolution_path_covariance=np.zeros(dimensions),
+            lower_bound=lower_bound, upper_bound=upper_bound)
 
     def ask(self, population_size: int | None = None) -> np.ndarray:
         size = (default_population_size(self.dimensions)

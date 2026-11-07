@@ -1824,7 +1824,8 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
     Args:
         scheduler_type: One of "FCFS", "NearestNeighbour", "RoundRobin",
             "Greedy", "Random", "Hungarian", "Auction", "GA", "SA",
-            "LearnedHungarian", "GraphImitation", "GraphExpert", "GraphPPO", "RainbowDQN",
+            "LearnedHungarian", "GraphImitation", "GraphExpert", "GraphPPO",
+            "CostGraphPPO", "GraphRainbow", "RainbowDQN",
             "QRDQN", "CQL", "LinUCB", "PPO_RL", "DQN", "SARSA"
         model_path: Path to a validated checkpoint for a learned scheduler.
         
@@ -1909,6 +1910,27 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
                   f"using Hungarian: {exc}")
             return fallback
 
+    if scheduler_type in {"CostGraphPPO", "GraphRainbow"}:
+        try:
+            from cost_guided_rl_schedulers import (
+                CostGraphPPOScheduler, GraphRainbowScheduler)
+            from rl_schedulers import RLSchedulerSafetyWrapper
+            scheduler_class = {
+                "CostGraphPPO": CostGraphPPOScheduler,
+                "GraphRainbow": GraphRainbowScheduler,
+            }[scheduler_type]
+            return RLSchedulerSafetyWrapper(
+                scheduler_class(model_path, seed=seed))
+        except ModelValidationError as exc:
+            if not allow_safe_fallback:
+                raise
+            fallback = HungarianScheduler()
+            fallback.name = f"{scheduler_type}_FALLBACK_HUNGARIAN"
+            fallback.fallback_reason = str(exc)
+            print(f"[Scheduler] {scheduler_type} unavailable; "
+                  f"using Hungarian: {exc}")
+            return fallback
+
     if scheduler_type in {"RainbowDQN", "QRDQN", "CQL"}:
         try:
             from advanced_rl_schedulers import (
@@ -1983,4 +2005,4 @@ def create_scheduler(scheduler_type: str, model_path: Optional[str] = None,
         return schedulers[scheduler_type]()
     
     raise ValueError(f"Unknown scheduler type: {scheduler_type}. "
-                     f"Available: {list(schedulers.keys()) + ['LearnedHungarian', 'GraphImitation', 'GraphPPO', 'RainbowDQN', 'QRDQN', 'CQL', 'LinUCB', 'PPO_RL', 'DQN', 'SARSA']}")
+                     f"Available: {list(schedulers.keys()) + ['LearnedHungarian', 'GraphImitation', 'GraphPPO', 'CostGraphPPO', 'GraphRainbow', 'RainbowDQN', 'QRDQN', 'CQL', 'LinUCB', 'PPO_RL', 'DQN', 'SARSA']}")

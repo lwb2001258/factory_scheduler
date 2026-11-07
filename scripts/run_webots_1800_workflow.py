@@ -507,7 +507,9 @@ def run_or_resume_episode(
         *, canonical_path: Path, webots: Path, scenario: str, seed: int,
         manifest: Path, scheduler: str, model_path: Path | None,
         fine_tune_objective: str | None,
-        fine_tune_algorithm: str | None = None) -> tuple[dict, bool]:
+        fine_tune_algorithm: str | None = None,
+        expected_result_scheduler: str | None = None) -> tuple[dict, bool]:
+    result_scheduler = expected_result_scheduler or scheduler
     model_hash = sha256_file(model_path) if model_path else None
     cached = load_json(canonical_path)
     if valid_episode(
@@ -515,7 +517,7 @@ def run_or_resume_episode(
             input_model_sha256=model_hash,
             fine_tune_objective=fine_tune_objective,
             fine_tune_algorithm=fine_tune_algorithm,
-            expected_scheduler=scheduler):
+            expected_scheduler=result_scheduler):
         print(f"[RESUME] {canonical_path.parent.relative_to(ROOT)}", flush=True)
         return cached, True
 
@@ -562,7 +564,7 @@ def run_or_resume_episode(
             input_model_sha256=model_hash,
             fine_tune_objective=fine_tune_objective,
             fine_tune_algorithm=fine_tune_algorithm,
-            expected_scheduler=scheduler):
+            expected_scheduler=result_scheduler):
         raise RuntimeError(
             f"Webots episode failed formal validation: {scheduler}/"
             f"{scenario}/{seed}")

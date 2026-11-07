@@ -46,7 +46,8 @@ from config import SCENARIOS, NUM_REPEATS
 SCHEDULER_TYPES = [
     "FCFS", "NearestNeighbour", "RoundRobin", "Greedy", "Random",
     "Hungarian", "Auction", "GA", "SA", "LearnedHungarian",
-    "GraphImitation", "GraphExpert", "TrafficHungarian", "GraphPPO", "RainbowDQN", "QRDQN", "CQL",
+    "GraphImitation", "GraphExpert", "TrafficHungarian", "GraphPPO",
+    "CostGraphPPO", "GraphRainbow", "RainbowDQN", "QRDQN", "CQL",
     "LinUCB", "PPO_RL", "SARSA", "DQN"]
 SCENARIO_KEYS = ["A", "B", "C"]
 RANDOM_SEEDS = [42, 123, 456, 789, 1024]

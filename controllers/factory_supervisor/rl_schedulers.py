@@ -268,6 +268,30 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
         self.fallback_decisions = 0
         self.timeout_count = 0
 
+    @property
+    def uses_traffic(self):
+        return bool(getattr(self.policy, "uses_traffic", False))
+
+    @property
+    def expert_coefficient_bundle(self):
+        return getattr(self.policy, "expert_coefficient_bundle", None)
+
+    @property
+    def expert_coefficient_sha256(self):
+        return getattr(self.policy, "expert_coefficient_sha256", None)
+
+    @property
+    def cost_prior_identity(self):
+        return getattr(self.policy, "cost_prior_identity", None)
+
+    @property
+    def objective(self):
+        return getattr(self.policy, "objective", None)
+
+    @property
+    def pure_policy_required(self):
+        return bool(getattr(self.policy, "pure_policy_required", False))
+
     def _physical_fine_tune_enabled(self) -> bool:
         enabled = any(os.environ.get(name, "0").strip().lower() in {
             "1", "true", "yes", "on"
@@ -278,7 +302,8 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
         return bool(enabled and self.policy.name in {
             "GraphPPO", "RainbowDQN", "QRDQN", "CQL", "LinUCB",
             "PPO_RL", "SARSA", "DQN",
-        })
+        } or enabled and self.policy.name.startswith((
+            "CostGraphPPO_", "GraphRainbow_")))
 
     def assign_task(self, pending_tasks, robot_states, congestion_map=None):
         result = self.assign(
@@ -343,6 +368,20 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
                 )
             policy_seconds = result.computation_time
             timed_out = result.computation_time > self.timeout_seconds
+            intentional_wait = bool(
+                result.is_feasible and not result.assignments and
+                result.diagnostics.get("intentional_wait", False))
+            if intentional_wait and not timed_out:
+                self.consecutive_failures = 0
+                self._last_source = "policy"
+                self.policy_decisions += 1
+                result.diagnostics.update({
+                    "fallback": False,
+                    "inference_ms": result.computation_time * 1000.0,
+                    "retry_attempt": retry_attempt,
+                    **self._diagnostic_counters(),
+                })
+                return result
             if result.is_feasible and result.assignments and not timed_out:
                 self.consecutive_failures = 0
                 self._last_source = "policy"
@@ -365,6 +404,21 @@ class RLSchedulerSafetyWrapper(BaseScheduler):
                     "reason": reason,
                     "fallback": False,
                     "physical_fine_tune_rejected": True,
+                    "inference_ms": result.computation_time * 1000.0,
+                    "retry_attempt": retry_attempt,
+                    **self._diagnostic_counters(),
+                })
+                return result
+            if self.pure_policy_required:
+                reason = result.diagnostics.get(
+                    "reason", "invalid_rl_output")
+                if timed_out:
+                    reason = "inference_timeout"
+                    self.timeout_count += 1
+                result.diagnostics.update({
+                    "reason": reason,
+                    "fallback": False,
+                    "pure_policy_rejected": True,
                     "inference_ms": result.computation_time * 1000.0,
                     "retry_attempt": retry_attempt,
                     **self._diagnostic_counters(),
